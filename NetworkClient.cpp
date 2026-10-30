@@ -1,9 +1,7 @@
 #include "NetworkClient.h"
-#include "NetworkProtocol.h"
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <cstring>
 
 NetworkClient::NetworkClient() : sock_fd(-1) {}
 
@@ -26,13 +24,66 @@ bool NetworkClient::connect_to_node(const char* ip, int port) {
 
 bool NetworkClient::send_record(const SpatialRecord& record) {
     if (sock_fd < 0) return false;
-
     PacketHeader header = {CMD_INGEST, sizeof(SpatialRecord)};
-
-    // Send Header followed by raw binary SpatialRecord
     send(sock_fd, &header, sizeof(PacketHeader), 0);
     send(sock_fd, &record, sizeof(SpatialRecord), 0);
     return true;
+}
+
+std::vector<SpatialRecord> NetworkClient::send_query(const QueryRequest& req) {
+    std::vector<SpatialRecord> matches;
+    if (sock_fd < 0) return matches;
+
+    PacketHeader header = {CMD_QUERY, sizeof(QueryRequest)};
+    send(sock_fd, &header, sizeof(PacketHeader), 0);
+    send(sock_fd, &req, sizeof(QueryRequest), 0);
+
+    PacketHeader resp_header;
+    if (recv(sock_fd, &resp_header, sizeof(PacketHeader), MSG_WAITALL) > 0) {
+        if (resp_header.command == CMD_QUERY_RESP && resp_header.payload_len > 0) {
+            size_t count = resp_header.payload_len / sizeof(SpatialRecord);
+            matches.resize(count);
+            recv(sock_fd, matches.data(), resp_header.payload_len, MSG_WAITALL);
+        }
+    }
+    return matches;
+}
+
+uint8_t NetworkClient::send_prepare(uint64_t tx_id, const SpatialRecord& record) {
+    if (sock_fd < 0) return CMD_VOTE_ABORT;
+
+    TxPacket packet = {tx_id, record};
+    PacketHeader header = {CMD_PREPARE, sizeof(TxPacket)};
+    send(sock_fd, &header, sizeof(PacketHeader), 0);
+    send(sock_fd, &packet, sizeof(TxPacket), 0);
+
+    PacketHeader resp;
+    if (recv(sock_fd, &resp, sizeof(PacketHeader), MSG_WAITALL) > 0) {
+        return resp.command;
+    }
+    return CMD_VOTE_ABORT;
+}
+
+bool NetworkClient::send_commit(uint64_t tx_id) {
+    if (sock_fd < 0) return false;
+
+    PacketHeader header = {CMD_COMMIT, sizeof(uint64_t)};
+    send(sock_fd, &header, sizeof(PacketHeader), 0);
+    send(sock_fd, &tx_id, sizeof(uint64_t), 0);
+
+    PacketHeader resp;
+    return (recv(sock_fd, &resp, sizeof(PacketHeader), MSG_WAITALL) > 0 && resp.command == CMD_ACK);
+}
+
+bool NetworkClient::send_abort(uint64_t tx_id) {
+    if (sock_fd < 0) return false;
+
+    PacketHeader header = {CMD_ABORT, sizeof(uint64_t)};
+    send(sock_fd, &header, sizeof(PacketHeader), 0);
+    send(sock_fd, &tx_id, sizeof(uint64_t), 0);
+
+    PacketHeader resp;
+    return (recv(sock_fd, &resp, sizeof(PacketHeader), MSG_WAITALL) > 0 && resp.command == CMD_ACK);
 }
 
 void NetworkClient::close_connection() {
