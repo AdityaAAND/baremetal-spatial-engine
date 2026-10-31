@@ -1,7 +1,5 @@
 #include "SpatialIndex.h"
 #include "MortonCode.h"
-#include <cmath>
-#include <algorithm>
 
 void SpatialIndex::insert(const SpatialRecord& record) {
     uint32_t x_int = quantize_coord(record.x);
@@ -15,10 +13,17 @@ void SpatialIndex::insert(const SpatialRecord& record) {
 std::vector<SpatialRecord> SpatialIndex::range_query(float x_min, float x_max, float y_min, float y_max, float z_min, float z_max) {
     std::vector<SpatialRecord> matches;
 
-    uint64_t min_key = calculate_z_order(quantize_coord(x_min), quantize_coord(y_min), quantize_coord(z_min));
-    uint64_t max_key = calculate_z_order(quantize_coord(x_max), quantize_coord(y_max), quantize_coord(z_max));
+    uint32_t x1 = quantize_coord(x_min);
+    uint32_t y1 = quantize_coord(y_min);
+    uint32_t z1 = quantize_coord(z_min);
 
-    // quantize_coord is monotone, so min corner key <= max corner key whenever min <= max per axis
+    uint32_t x2 = quantize_coord(x_max);
+    uint32_t y2 = quantize_coord(y_max);
+    uint32_t z2 = quantize_coord(z_max);
+
+    uint64_t min_key = calculate_z_order(x1, y1, z1);
+    uint64_t max_key = calculate_z_order(x2, y2, z2);
+
     if (min_key > max_key) return matches;
 
     auto it_low = btree_index.lower_bound(min_key);
@@ -33,4 +38,16 @@ std::vector<SpatialRecord> SpatialIndex::range_query(float x_min, float x_max, f
         }
     }
     return matches;
+}
+
+std::vector<SpatialRecord> SpatialIndex::extract_and_remove_range(uint64_t min_key, uint64_t max_key) {
+    std::vector<SpatialRecord> extracted;
+    auto it_low = btree_index.lower_bound(min_key);
+    auto it_high = btree_index.upper_bound(max_key);
+
+    for (auto it = it_low; it != it_high; ) {
+        extracted.push_back(it->second);
+        it = btree_index.erase(it);
+    }
+    return extracted;
 }

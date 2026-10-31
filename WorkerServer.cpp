@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <iostream>
+#include <cstring>
 
 WorkerServer::WorkerServer(int port, WriteAheadLog& wal_ref, BufferPool& pool_ref, SpatialIndex& index_ref)
     : server_fd(-1), port(port), wal(wal_ref), pool(pool_ref), index(index_ref), has_standby(false), standby_port(0) {}
@@ -113,6 +114,49 @@ void WorkerServer::start_listening() {
 
                 PacketHeader resp = {CMD_ACK, 0};
                 send(client_fd, &resp, sizeof(PacketHeader), 0);
+            }
+            else if (header.command == CMD_MIGRATE_RANGE) {
+                MigrateRangePayload payload;
+                recv(client_fd, &payload, sizeof(MigrateRangePayload), MSG_WAITALL);
+
+                // Guarantee NUL termination of the fixed-size IP field from the wire
+                char target_ip[sizeof(payload.target_ip)];
+                memcpy(target_ip, payload.target_ip, sizeof(target_ip));
+                target_ip[sizeof(target_ip) - 1] = '\0';
+
+                std::cout << "[Worker Node " << port << "] Executing Range Migration for keys ["
+                          << payload.min_key << ".." << payload.max_key << "] -> Target: "
+                          << target_ip << ":" << payload.target_port << "\n";
+
+                std::vector<SpatialRecord> records_to_migrate = index.extract_and_remove_range(payload.min_key, payload.max_key);
+
+                if (!records_to_migrate.empty()) {
+                    int dest_sock = socket(AF_INET, SOCK_STREAM, 0);
+                    sockaddr_in dest_addr{};
+                    dest_addr.sin_family = AF_INET;
+                    dest_addr.sin_port = htons(static_cast<uint16_t>(payload.target_port));
+                    inet_pton(AF_INET, target_ip, &dest_addr.sin_addr);
+
+                    if (dest_sock >= 0 && connect(dest_sock, (struct sockaddr*)&dest_addr, sizeof(dest_addr)) == 0) {
+                        for (const auto& rec : records_to_migrate) {
+                            PacketHeader ingest_header = {CMD_INGEST, sizeof(SpatialRecord)};
+                            send(dest_sock, &ingest_header, sizeof(PacketHeader), 0);
+                            send(dest_sock, &rec, sizeof(SpatialRecord), 0);
+                        }
+                        std::cout << "[Worker Node " << port << "] Successfully migrated "
+                                  << records_to_migrate.size() << " records to Node " << payload.target_port << "\n";
+                    } else {
+                        // Target unreachable: put the records back so they are not lost
+                        for (const auto& rec : records_to_migrate) index.insert(rec);
+                        std::cout << "[Worker Node " << port << "] Migration failed: cannot reach "
+                                  << target_ip << ":" << payload.target_port << " -> restored "
+                                  << records_to_migrate.size() << " records locally\n";
+                    }
+                    if (dest_sock >= 0) close(dest_sock);
+                }
+
+                PacketHeader ack = {CMD_ACK, 0};
+                send(client_fd, &ack, sizeof(PacketHeader), 0);
             }
             else if (header.command == CMD_QUERY) {
                 QueryRequest req;

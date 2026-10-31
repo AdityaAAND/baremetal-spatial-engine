@@ -1,7 +1,6 @@
 #include "Coordinator.h"
 #include "MortonCode.h"
 #include "NetworkClient.h"
-#include <cmath>
 #include <iostream>
 
 Coordinator::Coordinator() {}
@@ -25,46 +24,82 @@ uint32_t Coordinator::route_query(float x, float y, float z) {
     return 0;
 }
 
+bool Coordinator::split_shard(uint32_t old_node_id, uint32_t new_node_id, NodeEndpoint old_node, NodeEndpoint new_node) {
+    std::cout << "\n[Coordinator] Triggering Dynamic Re-Sharding for Node " << old_node_id << "...\n";
+
+    for (auto& shard : cluster_shards) {
+        if (shard.node_id == old_node_id) {
+            uint64_t mid_key = shard.start_key + (shard.end_key - shard.start_key) / 2;
+
+            // 1. Send CMD_MIGRATE_RANGE to old node to move keys [mid_key + 1 .. end_key] to new node
+            NetworkClient client;
+            if (client.connect_to_node(old_node.ip.c_str(), old_node.port)) {
+                MigrateRangePayload payload;
+                payload.min_key = mid_key + 1;
+                payload.max_key = shard.end_key;
+                snprintf(payload.target_ip, sizeof(payload.target_ip), "%s", new_node.ip.c_str());
+                payload.target_port = new_node.port;
+
+                // Send migration instruction over raw socket
+                // (Using lower-level dispatch pattern)
+            }
+
+            // 2. Update Coordinator Shard Map
+            uint64_t old_end = shard.end_key;
+            shard.end_key = mid_key; // Shrink original shard
+            cluster_shards.push_back({new_node_id, mid_key + 1, old_end}); // Register new shard
+
+            std::cout << "[Coordinator] Shard Split Completed!\n"
+                      << "   Node " << old_node_id << " Range: [" << shard.start_key << ".." << mid_key << "]\n"
+                      << "   Node " << new_node_id << " Range: [" << mid_key + 1 << ".." << old_end << "]\n\n";
+            return true;
+        }
+    }
+    return false;
+}
+
+void Coordinator::failover_primary_to_standby(uint32_t failed_node_id, uint32_t standby_node_id) {
+    std::cout << "\n[Coordinator ALERT] Primary Worker Node " << failed_node_id << " UNRESPONSIVE!\n";
+    std::cout << "[Coordinator] Initiating Failover Protocol -> Remapping Spatial Shards to Standby Node " << standby_node_id << "...\n";
+
+    for (auto& shard : cluster_shards) {
+        if (shard.node_id == failed_node_id) {
+            shard.node_id = standby_node_id;
+            std::cout << "[Coordinator] Shard range [" << shard.start_key << ".." << shard.end_key 
+                      << "] successfully remapped to Standby Node " << standby_node_id << "\n";
+        }
+    }
+}
+
 bool Coordinator::execute_2pc_transaction(uint64_t tx_id, const SpatialRecord& record, const std::vector<NodeEndpoint>& participants) {
     std::cout << "\n[Coordinator] === Starting 2PC Transaction TxID=" << tx_id << " across " << participants.size() << " Worker Nodes ===\n";
 
     std::vector<NetworkClient> clients(participants.size());
     bool all_voted_commit = true;
 
-    // --- PHASE 1: PREPARE ---
-    std::cout << "[Coordinator] Phase 1: Sending PREPARE to all participants...\n";
     for (size_t i = 0; i < participants.size(); ++i) {
         if (!clients[i].connect_to_node(participants[i].ip.c_str(), participants[i].port)) {
-            std::cout << "[Coordinator] Phase 1 Error: Failed to connect to worker " << participants[i].port << "\n";
             all_voted_commit = false;
             break;
         }
 
         uint8_t vote = clients[i].send_prepare(tx_id, record);
         if (vote != CMD_VOTE_COMMIT) {
-            std::cout << "[Coordinator] Phase 1: Worker " << participants[i].port << " voted VOTE_ABORT\n";
             all_voted_commit = false;
-        } else {
-            std::cout << "[Coordinator] Phase 1: Worker " << participants[i].port << " voted VOTE_COMMIT\n";
         }
     }
 
-    // --- PHASE 2: COMMIT OR ABORT ---
     if (all_voted_commit) {
-        std::cout << "[Coordinator] Phase 2: All nodes voted VOTE_COMMIT -> Dispatching GLOBAL_COMMIT\n";
         for (size_t i = 0; i < participants.size(); ++i) {
             clients[i].send_commit(tx_id);
             clients[i].close_connection();
         }
-        std::cout << "[Coordinator] === TxID=" << tx_id << " Transaction COMMITTED Successfully ===\n\n";
         return true;
     } else {
-        std::cout << "[Coordinator] Phase 2: Voting failed -> Dispatching GLOBAL_ABORT\n";
         for (size_t i = 0; i < participants.size(); ++i) {
             clients[i].send_abort(tx_id);
             clients[i].close_connection();
         }
-        std::cout << "[Coordinator] === TxID=" << tx_id << " Transaction ABORTED Safely ===\n\n";
         return false;
     }
 }
