@@ -8,7 +8,54 @@
 #include <cstring>
 
 WorkerServer::WorkerServer(int port, WriteAheadLog& wal_ref, BufferPool& pool_ref, SpatialIndex& index_ref)
-    : server_fd(-1), port(port), wal(wal_ref), pool(pool_ref), index(index_ref), has_standby(false), standby_port(0) {}
+    : server_fd(-1), port(port), wal(wal_ref), pool(pool_ref), index(index_ref), has_standby(false), standby_port(0), recovered(false) {}
+
+size_t WorkerServer::recover() {
+    if (recovered) return 0;
+    recovered = true;
+
+    // Rebuild the index from durable entries; PREPAREs with no COMMIT/ABORT are re-staged
+    std::unordered_map<uint64_t, std::vector<SpatialRecord>> pending;
+    size_t applied = 0;
+    wal.for_each([&](const LogEntry& e) {
+        switch (e.type) {
+            case LOG_DATA:
+                index.insert(e.rec);
+                ++applied;
+                break;
+            case LOG_PREPARE:
+                pending[e.tx_id].push_back(e.rec);
+                break;
+            case LOG_COMMIT: {
+                auto it = pending.find(e.tx_id);
+                if (it != pending.end()) {
+                    for (const auto& rec : it->second) index.insert(rec);
+                    applied += it->second.size();
+                    pending.erase(it);
+                }
+                break;
+            }
+            case LOG_ABORT:
+                pending.erase(e.tx_id);
+                break;
+        }
+    });
+
+    {
+        std::lock_guard<std::mutex> lock(tx_mutex);
+        for (auto& entry : pending) staged_tx[entry.first] = std::move(entry.second);
+    }
+
+    std::cout << "[Worker Node " << port << "] Recovery: replayed " << wal.size() << " WAL entries -> "
+              << applied << " records restored, " << pending.size() << " in-flight tx re-staged\n";
+    return applied;
+}
+
+void WorkerServer::log_or_warn(const SpatialRecord& record) {
+    if (!wal.append(record)) {
+        std::cerr << "[Worker Node " << port << "] WAL full: record " << record.metadata << " is not durable\n";
+    }
+}
 
 void WorkerServer::set_standby_node(const std::string& ip, int port) {
     standby_ip = ip;
@@ -37,6 +84,8 @@ void WorkerServer::forward_to_standby(const SpatialRecord& record) {
 }
 
 void WorkerServer::start_listening() {
+    recover();
+
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -60,16 +109,16 @@ void WorkerServer::start_listening() {
             if (header.command == CMD_INGEST) {
                 SpatialRecord record;
                 recv(client_fd, &record, sizeof(SpatialRecord), MSG_WAITALL);
-                
-                wal.append(record);
+
+                log_or_warn(record);
                 pool.insert(record);
                 forward_to_standby(record);
             }
             else if (header.command == CMD_REPLICATE) {
                 SpatialRecord record;
                 recv(client_fd, &record, sizeof(SpatialRecord), MSG_WAITALL);
-                
-                wal.append(record);
+
+                log_or_warn(record);
                 pool.insert(record);
                 std::cout << "[Standby Worker " << port << "] Ingested replicated record into local WAL & index\n";
             }
@@ -83,7 +132,7 @@ void WorkerServer::start_listening() {
                 } else {
                     {
                         std::lock_guard<std::mutex> lock(tx_mutex);
-                        staged_tx[tx_pkt.tx_id] = tx_pkt.record;
+                        staged_tx[tx_pkt.tx_id].push_back(tx_pkt.record);
                     }
                     PacketHeader resp = {CMD_VOTE_COMMIT, 0};
                     send(client_fd, &resp, sizeof(PacketHeader), 0);
@@ -96,9 +145,12 @@ void WorkerServer::start_listening() {
                 std::lock_guard<std::mutex> lock(tx_mutex);
                 auto it = staged_tx.find(tx_id);
                 if (it != staged_tx.end()) {
-                    wal.append(it->second);
-                    pool.insert(it->second);
-                    forward_to_standby(it->second);
+                    for (const auto& rec : it->second) {
+                        log_or_warn(rec);
+                        pool.insert(rec);
+                        forward_to_standby(rec);
+                    }
+                    std::cout << "[Worker " << port << "] Phase 2: Committed Tx " << tx_id << " (" << it->second.size() << " record(s))\n";
                     staged_tx.erase(it);
                 }
 
@@ -129,6 +181,7 @@ void WorkerServer::start_listening() {
                           << target_ip << ":" << payload.target_port << "\n";
 
                 std::vector<SpatialRecord> records_to_migrate = index.extract_and_remove_range(payload.min_key, payload.max_key);
+                bool migrated_ok = true;
 
                 if (!records_to_migrate.empty()) {
                     int dest_sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -148,6 +201,7 @@ void WorkerServer::start_listening() {
                     } else {
                         // Target unreachable: put the records back so they are not lost
                         for (const auto& rec : records_to_migrate) index.insert(rec);
+                        migrated_ok = false;
                         std::cout << "[Worker Node " << port << "] Migration failed: cannot reach "
                                   << target_ip << ":" << payload.target_port << " -> restored "
                                   << records_to_migrate.size() << " records locally\n";
@@ -155,7 +209,8 @@ void WorkerServer::start_listening() {
                     if (dest_sock >= 0) close(dest_sock);
                 }
 
-                PacketHeader ack = {CMD_ACK, 0};
+                // CMD_ABORT acts as a NACK so the Coordinator leaves its shard map unchanged
+                PacketHeader ack = {static_cast<uint8_t>(migrated_ok ? CMD_ACK : CMD_ABORT), 0};
                 send(client_fd, &ack, sizeof(PacketHeader), 0);
             }
             else if (header.command == CMD_QUERY) {

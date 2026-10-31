@@ -5,6 +5,9 @@
 // Usable range is roughly [-COORD_OFFSET, -COORD_OFFSET + 2097.151]; values outside are clamped.
 constexpr float COORD_OFFSET = 1000.0f;
 
+// Largest possible Z-order key (3 axes x 21 bits = 63 bits), for writing full-range shard bounds
+constexpr uint64_t MAX_MORTON_KEY = 0x7FFFFFFFFFFFFFFFULL;
+
 // Order-preserving quantizer: monotone non-decreasing in v, millimeter resolution, clamped to 21 bits
 uint32_t quantize_coord(float v);
 

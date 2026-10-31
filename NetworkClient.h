@@ -16,6 +16,7 @@ public:
     uint8_t send_prepare(uint64_t tx_id, const SpatialRecord& record);
     bool send_commit(uint64_t tx_id);
     bool send_abort(uint64_t tx_id);
+    bool send_migrate(const MigrateRangePayload& payload);
 
     void close_connection();
     ~NetworkClient();

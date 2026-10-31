@@ -2,6 +2,10 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <sys/time.h>
+
+// Upper bound on how long any reply may take before the peer is treated as failed
+static constexpr int RECV_TIMEOUT_SEC = 5;
 
 NetworkClient::NetworkClient() : sock_fd(-1) {}
 
@@ -19,6 +23,10 @@ bool NetworkClient::connect_to_node(const char* ip, int port) {
         sock_fd = -1;
         return false;
     }
+
+    // Without this, recv() blocks forever on a hung worker
+    timeval tv{RECV_TIMEOUT_SEC, 0};
+    setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     return true;
 }
 
@@ -57,8 +65,9 @@ uint8_t NetworkClient::send_prepare(uint64_t tx_id, const SpatialRecord& record)
     send(sock_fd, &header, sizeof(PacketHeader), 0);
     send(sock_fd, &packet, sizeof(TxPacket), 0);
 
+    // A timeout can return a partial header, so require the full size
     PacketHeader resp;
-    if (recv(sock_fd, &resp, sizeof(PacketHeader), MSG_WAITALL) > 0) {
+    if (recv(sock_fd, &resp, sizeof(PacketHeader), MSG_WAITALL) == static_cast<ssize_t>(sizeof(PacketHeader))) {
         return resp.command;
     }
     return CMD_VOTE_ABORT;
@@ -72,7 +81,8 @@ bool NetworkClient::send_commit(uint64_t tx_id) {
     send(sock_fd, &tx_id, sizeof(uint64_t), 0);
 
     PacketHeader resp;
-    return (recv(sock_fd, &resp, sizeof(PacketHeader), MSG_WAITALL) > 0 && resp.command == CMD_ACK);
+    return (recv(sock_fd, &resp, sizeof(PacketHeader), MSG_WAITALL) == static_cast<ssize_t>(sizeof(PacketHeader))
+            && resp.command == CMD_ACK);
 }
 
 bool NetworkClient::send_abort(uint64_t tx_id) {
@@ -83,7 +93,21 @@ bool NetworkClient::send_abort(uint64_t tx_id) {
     send(sock_fd, &tx_id, sizeof(uint64_t), 0);
 
     PacketHeader resp;
-    return (recv(sock_fd, &resp, sizeof(PacketHeader), MSG_WAITALL) > 0 && resp.command == CMD_ACK);
+    return (recv(sock_fd, &resp, sizeof(PacketHeader), MSG_WAITALL) == static_cast<ssize_t>(sizeof(PacketHeader))
+            && resp.command == CMD_ACK);
+}
+
+bool NetworkClient::send_migrate(const MigrateRangePayload& payload) {
+    if (sock_fd < 0) return false;
+
+    PacketHeader header = {CMD_MIGRATE_RANGE, sizeof(MigrateRangePayload)};
+    send(sock_fd, &header, sizeof(PacketHeader), 0);
+    send(sock_fd, &payload, sizeof(MigrateRangePayload), 0);
+
+    // The worker replies CMD_ACK only after the records reached the target
+    PacketHeader resp;
+    return (recv(sock_fd, &resp, sizeof(PacketHeader), MSG_WAITALL) == static_cast<ssize_t>(sizeof(PacketHeader))
+            && resp.command == CMD_ACK);
 }
 
 void NetworkClient::close_connection() {
