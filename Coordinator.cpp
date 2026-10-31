@@ -11,9 +11,9 @@ void Coordinator::register_shard(uint32_t node_id, uint64_t start_key, uint64_t 
 }
 
 uint32_t Coordinator::route_query(float x, float y, float z) {
-    uint32_t x_int = static_cast<uint32_t>(std::abs(x * 1000.0f));
-    uint32_t y_int = static_cast<uint32_t>(std::abs(y * 1000.0f));
-    uint32_t z_int = static_cast<uint32_t>(std::abs(z * 1000.0f));
+    uint32_t x_int = quantize_coord(x);
+    uint32_t y_int = quantize_coord(y);
+    uint32_t z_int = quantize_coord(z);
 
     uint64_t target_key = calculate_z_order(x_int, y_int, z_int);
 

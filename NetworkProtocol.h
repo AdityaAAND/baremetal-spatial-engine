@@ -11,7 +11,8 @@ enum CommandType : uint8_t {
     CMD_VOTE_COMMIT = 0x06,
     CMD_VOTE_ABORT  = 0x07,
     CMD_COMMIT      = 0x08,
-    CMD_ABORT       = 0x09
+    CMD_ABORT       = 0x09,
+    CMD_REPLICATE   = 0x0A
 };
 
 #pragma pack(push, 1)
