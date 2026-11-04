@@ -1,8 +1,7 @@
 #include "MortonClient.h"
-#include <iostream>
 
-SpatialQueryBuilder::SpatialQueryBuilder(NetworkClient& net_client) 
-    : client(net_client), req{0, 0, 0, 0, 0, 0}, bbox_set(false) {}
+SpatialQueryBuilder::SpatialQueryBuilder(Coordinator& coordinator_ref) 
+    : coordinator(coordinator_ref), req{0, 0, 0, 0, 0, 0}, bbox_set(false) {}
 
 SpatialQueryBuilder& SpatialQueryBuilder::bounding_box(float x_min, float x_max, float y_min, float y_max, float z_min, float z_max) {
     req = {x_min, x_max, y_min, y_max, z_min, z_max};
@@ -10,33 +9,45 @@ SpatialQueryBuilder& SpatialQueryBuilder::bounding_box(float x_min, float x_max,
     return *this;
 }
 
-std::vector<SpatialRecord> SpatialQueryBuilder::execute() {
+QueryResult SpatialQueryBuilder::execute() {
+    QueryResult result{};
     if (!bbox_set) {
-        std::cerr << "[MortonClient SDK Error] Bounding box parameters not specified!\n";
-        return {};
+        result.plan.plan_type = ExecutionPlanType::INVALID_PLAN;
+        result.error = "bounding box not specified";
+        return result;
     }
-    return client.send_query(req);
+
+    result.plan = QueryOptimizer::optimize(req);
+    if (result.plan.plan_type == ExecutionPlanType::INVALID_PLAN) {
+        result.error = result.plan.description;
+        return result;
+    }
+
+    // Sub-boxes are disjoint, so concatenating their rows cannot produce duplicates
+    for (const auto& sub_query : result.plan.sub_queries) {
+        if (!coordinator.execute_query(sub_query, result.records)) {
+            // Rows from the shards that did answer would pass for a complete result
+            result.records.clear();
+            result.error = "a shard failed to answer the query";
+            return result;
+        }
+    }
+
+    result.ok = true;
+    return result;
 }
 
-MortonClient::MortonClient(const std::string& ip, int port) : server_ip(ip), server_port(port) {}
-
-bool MortonClient::connect() {
-    return net_client.connect_to_node(server_ip.c_str(), server_port);
-}
-
-void MortonClient::disconnect() {
-    net_client.close_connection();
-}
+MortonClient::MortonClient(Coordinator& coordinator_ref) : coordinator(coordinator_ref) {}
 
 bool MortonClient::insert(const SpatialRecord& record) {
-    return net_client.send_record(record);
+    return coordinator.execute_2pc_transaction(coordinator.next_tx_id(), {record});
 }
 
-bool MortonClient::insert(float x, float y, float z, uint64_t timestamp, uint32_t intensity) {
-    SpatialRecord rec = {timestamp, x, y, z, intensity};
-    return net_client.send_record(rec);
+bool MortonClient::insert(float x, float y, float z, uint64_t timestamp, uint32_t metadata) {
+    SpatialRecord rec = {timestamp, x, y, z, metadata};
+    return insert(rec);
 }
 
 SpatialQueryBuilder MortonClient::query() {
-    return SpatialQueryBuilder(net_client);
+    return SpatialQueryBuilder(coordinator);
 }

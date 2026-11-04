@@ -16,3 +16,6 @@ uint64_t expand_bits(uint32_t v);
 
 // Combines X, Y, and Z into a single 64-bit Z-order curve key
 uint64_t calculate_z_order(uint32_t x, uint32_t y, uint32_t z);
+
+// Z-order key of a point, from raw coordinates
+uint64_t point_key(float x, float y, float z);
