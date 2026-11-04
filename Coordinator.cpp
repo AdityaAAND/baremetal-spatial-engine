@@ -5,8 +5,10 @@
 #include <algorithm>
 #include <cstdio>
 #include <map>
+#include <set>
 
-Coordinator::Coordinator() {}
+// Generated ids start above the small hand-picked ids callers pass to execute_2pc_transaction
+Coordinator::Coordinator() : last_tx_id(1ULL << 32) {}
 
 void Coordinator::register_node(uint32_t node_id, const NodeEndpoint& endpoint) {
     node_endpoints[node_id] = endpoint;
@@ -171,4 +173,34 @@ bool Coordinator::execute_2pc_transaction(uint64_t tx_id, const std::vector<Spat
         std::cout << "[Coordinator] === TxID=" << tx_id << " ABORTED ===\n";
         return false;
     }
+}
+
+uint64_t Coordinator::next_tx_id() {
+    return ++last_tx_id;
+}
+
+bool Coordinator::execute_query(const QueryRequest& box, std::vector<SpatialRecord>& results) {
+    // Every point in the box has a key between the corner keys, so other shards cannot hold matches
+    const uint64_t min_key = point_key(box.x_min, box.y_min, box.z_min);
+    const uint64_t max_key = point_key(box.x_max, box.y_max, box.z_max);
+
+    // A set because a node owns several ranges after a split, and must only be asked once
+    std::set<uint32_t> nodes;
+    for (const auto& shard : cluster_shards) {
+        if (shard.start_key <= max_key && shard.end_key >= min_key) nodes.insert(shard.node_id);
+    }
+
+    for (uint32_t node_id : nodes) {
+        auto endpoint = node_endpoints.find(node_id);
+        NetworkClient client;
+        std::vector<SpatialRecord> matches;
+        if (endpoint == node_endpoints.end()
+            || !client.connect_to_node(endpoint->second.ip.c_str(), endpoint->second.port)
+            || !client.send_query(box, matches)) {
+            std::cout << "[Coordinator] Query failed: no answer from Node " << node_id << "\n";
+            return false;
+        }
+        results.insert(results.end(), matches.begin(), matches.end());
+    }
+    return true;
 }

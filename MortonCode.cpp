@@ -25,3 +25,7 @@ uint64_t calculate_z_order(uint32_t x, uint32_t y, uint32_t z) {
     // Interleave the bits: X gets bit 0, Y gets bit 1, Z gets bit 2
     return (expand_bits(x) | (expand_bits(y) << 1) | (expand_bits(z) << 2));
 }
+
+uint64_t point_key(float x, float y, float z) {
+    return calculate_z_order(quantize_coord(x), quantize_coord(y), quantize_coord(z));
+}

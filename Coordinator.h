@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include "NodeConfig.h"
 #include "SpatialRecord.h"
+#include "NetworkProtocol.h"
 
 struct NodeEndpoint{
     std::string ip;
@@ -15,6 +16,7 @@ class Coordinator {
 private:
     std::vector<ShardRange> cluster_shards;
     std::unordered_map<uint32_t, NodeEndpoint> node_endpoints; // node_id -> network address
+    uint64_t last_tx_id;
 
 public:
     Coordinator();
@@ -25,6 +27,9 @@ public:
     void failover_primary_to_standby(uint32_t failed_node_id, uint32_t standby_node_id);
     // Atomically writes a batch: each record is sent only to the shard that owns its Z-order key
     bool execute_2pc_transaction(uint64_t tx_id, const std::vector<SpatialRecord>& records);
+    uint64_t next_tx_id();
+    // Appends the matches from every shard overlapping the box; false if any shard failed to answer
+    bool execute_query(const QueryRequest& box, std::vector<SpatialRecord>& results);
     const std::vector<ShardRange>& get_shards() const{return cluster_shards;}
 
 };

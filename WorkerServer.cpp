@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <iostream>
+#include <cerrno>
 #include <cstring>
 
 WorkerServer::WorkerServer(int port, WriteAheadLog& wal_ref, BufferPool& pool_ref, SpatialIndex& index_ref)
@@ -95,8 +96,13 @@ void WorkerServer::start_listening() {
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(port);
 
-    bind(server_fd, (struct sockaddr*)&address, sizeof(address));
-    listen(server_fd, 5);
+    // Serving without the bind would leave clients talking to whatever does own this port
+    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0 || listen(server_fd, 5) < 0) {
+        std::cerr << "[Worker Node " << port << "] Cannot listen on TCP port " << port << ": " << strerror(errno) << "\n";
+        close(server_fd);
+        server_fd = -1;
+        return;
+    }
 
     std::cout << "[Worker Node " << port << "] Listening on TCP port " << port << "...\n";
 
