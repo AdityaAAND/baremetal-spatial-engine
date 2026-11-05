@@ -2,3 +2,4 @@ spatial_db
 spatial_wal.dat
 *.dat
 *.o
+*.log

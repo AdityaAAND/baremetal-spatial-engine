@@ -7,45 +7,186 @@
 #include "MortonClient.h"
 #include "QueryOptimizer.h"
 #include "KittiLoader.h"
+#include "QueryExecutor.h"
+#include "MortonCode.h"
+#include <algorithm>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <limits>
+#include <memory>
+#include <string>
+#include <unistd.h>
+#include <vector>
 #include <thread>
 #include <chrono>
+
+static constexpr int FIRST_PORT = 8081;
+static constexpr int MAX_SHARDS = 16;
+static constexpr const char* SHARD_MAP_FILE = "shard_map.dat";
+
+struct Shard {
+    SpatialIndex index;
+    WriteAheadLog wal;
+    BufferPool pool;
+    WorkerServer worker;
+
+    Shard(int port, const std::string& wal_path)
+        : wal(wal_path.c_str(), 1024 * 1024 * 100), pool(1, index), worker(port, wal, pool, index) {}
+};
+
+struct Options {
+    bool shell = false;
+    int shards = 0; // 0 means not given
+    std::string file_path = "000000.bin";
+};
 
 void run_worker(WorkerServer* server) {
     server->start_listening();
 }
 
+static bool parse_args(int argc, char* argv[], Options& options) {
+    bool path_given = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--shell") {
+            options.shell = true;
+        } else if (arg == "--shards") {
+            if (++i == argc) return false;
+            char* end = nullptr;
+            const long count = std::strtol(argv[i], &end, 10);
+            if (*end != '\0' || count < 1 || count > MAX_SHARDS) return false;
+            options.shards = static_cast<int>(count);
+        } else if (arg.rfind("--", 0) == 0 || path_given) {
+            return false;
+        } else {
+            options.file_path = arg;
+            path_given = true;
+        }
+    }
+    return !(options.shards != 0 && !options.shell) && !(options.shell && path_given);
+}
+
+// Nodes are numbered by port from FIRST_PORT, so the highest node says how many workers the map needs
+static int workers_in_map(const Coordinator& coordinator) {
+    int count = 0;
+    for (const ShardRange& shard : coordinator.get_shards()) {
+        count = std::max(count, static_cast<int>(shard.node_id) - FIRST_PORT + 1);
+    }
+    return count;
+}
+
+// A starting point only: real data clusters in a narrow band of keys, which is why REBALANCE exists
+static void register_even_shards(Coordinator& coordinator, int count) {
+    const uint64_t width = MAX_MORTON_KEY / static_cast<uint64_t>(count);
+    for (int i = 0; i < count; ++i) {
+        const uint64_t start = static_cast<uint64_t>(i) * width;
+        const uint64_t end = i + 1 == count ? MAX_MORTON_KEY : start + width - 1;
+        coordinator.register_shard(static_cast<uint32_t>(FIRST_PORT + i), start, end);
+    }
+}
+
 int main(int argc, char* argv[]) {
+    Options options;
+    if (!parse_args(argc, argv, options)) {
+        std::cerr << "usage: spatial_db [frame.bin]\n"
+                  << "       spatial_db --shell [--shards N]   (N from 1 to " << MAX_SHARDS << ")\n";
+        return 1;
+    }
+
+    Coordinator coordinator;
+    const bool map_loaded = options.shell && coordinator.load_shard_map(SHARD_MAP_FILE);
+    const int saved_workers = map_loaded ? workers_in_map(coordinator) : 0;
+
+    // Refused rather than ignored: the workers left out would take their points with them
+    if (options.shards != 0 && options.shards < saved_workers) {
+        std::cerr << "error: the data is spread across " << saved_workers << " workers, so it can't start with "
+                  << options.shards << ".\nUse --shards " << saved_workers
+                  << ", or delete shard_*_wal.dat and " << SHARD_MAP_FILE << " to start empty.\n";
+        return 1;
+    }
+
+    int worker_count = 1;
+    if (options.shell) worker_count = options.shards != 0 ? options.shards : std::max(saved_workers, 1);
+
+    // Every component logs to std::cout, which would bury query results. Moving std::cout to a
+    // file before the workers start keeps the terminal for results only.
+    std::streambuf* terminal = std::cout.rdbuf();
+    std::ostream shell_out(terminal);
+    std::ofstream shell_log;
+    if (options.shell) {
+        shell_log.open("spatial_shell.log");
+        std::cout.rdbuf(shell_log.rdbuf());
+    }
+
     std::cout << "=================================================================\n";
     std::cout << "        MORTON-DB: KITTI REAL 3D LIDAR INGESTION & QUERY TEST     \n";
     std::cout << "=================================================================\n";
 
-    std::string file_path = (argc > 1) ? argv[1] : "000000.bin";
+    // 1. Boot Workers. The shell's WALs are separate from the demo's, which has no shard map to match.
+    std::vector<std::unique_ptr<Shard>> shards;
+    std::vector<std::thread> threads;
+    for (int i = 0; i < worker_count; ++i) {
+        const int port = FIRST_PORT + i;
+        const std::string wal_path = options.shell ? "shard_" + std::to_string(port) + "_wal.dat" : "kitti_wal.dat";
+        shards.push_back(std::make_unique<Shard>(port, wal_path));
+        shards.back()->worker.recover(); // here, not in the thread, so the first command can't beat it
+        threads.emplace_back(run_worker, &shards.back()->worker);
+    }
 
-    // 1. Boot Worker Server on Port 8081
-    SpatialIndex index;
-    WriteAheadLog wal("kitti_wal.dat", 1024 * 1024 * 100);
-    BufferPool pool(1, index);
-    WorkerServer worker(8081, wal, pool, index);
-    std::thread w_thread(run_worker, &worker);
+    auto stop_workers = [&]() {
+        for (auto& shard : shards) shard->worker.stop_server();
+        for (auto& thread : threads) thread.detach();
+    };
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-    // 2. Provision Coordinator & Register Shard Range
-    Coordinator coordinator;
-    coordinator.register_node(8081, {"127.0.0.1", 8081});
-    coordinator.register_shard(8081, 0, std::numeric_limits<uint64_t>::max());
+    // 2. Provision Coordinator & Register Shard Ranges
+    for (int i = 0; i < worker_count; ++i) {
+        coordinator.register_node(static_cast<uint32_t>(FIRST_PORT + i), {"127.0.0.1", FIRST_PORT + i});
+    }
+    if (!options.shell) {
+        coordinator.register_shard(FIRST_PORT, 0, std::numeric_limits<uint64_t>::max());
+    } else if (!map_loaded) {
+        register_even_shards(coordinator, worker_count);
+        coordinator.save_shard_map(SHARD_MAP_FILE);
+    }
 
     MortonClient client(coordinator);
 
+    if (options.shell) {
+        shell_out << "Morton-DB shell with " << worker_count << (worker_count == 1 ? " worker" : " workers")
+                  << ". Type HELP; for commands and EXIT; to quit.\n";
+
+        if (saved_workers != 0 && worker_count > saved_workers) {
+            shell_out << "note: the new workers own no keys yet. Run REBALANCE; to share the data with them.\n";
+        }
+        if (!map_loaded) {
+            uint64_t stored = 0;
+            for (uint32_t node : coordinator.node_ids()) {
+                uint64_t count = 0;
+                if (coordinator.node_point_count(node, count)) stored += count;
+            }
+            if (stored > 0) {
+                shell_out << "note: found " << stored << " points but no shard map, so queries may miss some. Run REBALANCE; to fix this.\n";
+            }
+        }
+
+        QueryExecutor executor(client, coordinator, shell_out, SHARD_MAP_FILE);
+        run_shell(executor, std::cin, shell_out, isatty(STDIN_FILENO) != 0 && isatty(STDOUT_FILENO) != 0);
+
+        stop_workers();
+        std::cout.rdbuf(terminal); // shell_log is about to close
+        return 0;
+    }
+
     // 3. Ingest Real KITTI Point Cloud File
-    std::cout << "\n--- STEP 1: Ingesting Binary LiDAR Frame (" << file_path << ") ---\n";
-    KittiLoadResult res = KittiLoader::load_bin_file(client, file_path);
+    std::cout << "\n--- STEP 1: Ingesting Binary LiDAR Frame (" << options.file_path << ") ---\n";
+    KittiLoadResult res = KittiLoader::load_bin_file(client, options.file_path);
 
     if (!res.success) {
         std::cerr << "[FAIL] Failed to ingest KITTI binary dataset.\n";
-        worker.stop_server();
-        if (w_thread.joinable()) w_thread.detach();
+        stop_workers();
         return 1;
     }
 
@@ -77,8 +218,7 @@ int main(int argc, char* argv[]) {
         std::cout << "[FAIL] Spatial range query failed.\n";
     }
 
-    worker.stop_server();
-    if (w_thread.joinable()) w_thread.detach();
+    stop_workers();
 
     std::cout << "\n=================================================================\n";
     std::cout << "        KITTI DATASET INGESTION & SEARCH VERIFIED CLEAN          \n";
