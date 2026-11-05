@@ -2,6 +2,83 @@
 
 A running log of work on this project and the reasons behind it, newest first.
 
+## 2026-11-05: Updated the KITTI query block in main.cpp
+
+The query block in [main.cpp](main.cpp) now uses the current SDK fields, so `main.cpp` compiles. The KITTI demo still can't build or run, because `KittiLoader.cpp` is empty and the blockers below remain. Nothing is committed.
+
+### Decisions
+
+- **Used `r.metadata` instead of the pasted `r.payload`.** `SpatialRecord` has no `payload` field, so the pasted line wouldn't compile. The printed label stays `Payload`.
+- **Kept the existing bounding-box comment,** which the pasted block didn't include.
+- **Fixed only the query block.** The blockers below are outside the requested edit, so they're reported rather than changed.
+
+### Verification
+
+`main.cpp` compiles on its own. Linking fails with an undefined `KittiLoader::load_bin_file`. The run results below came from a throwaway loader and a patched copy of `main.cpp` in the scratchpad, not from repo code.
+
+### Blockers found
+
+| Problem | Evidence |
+|---|---|
+| `KittiLoader.cpp` is empty (0 bytes). | The link fails. |
+| `main.cpp` never calls `register_node`, and its shard range of `0..1e10` is far below real Morton keys. | All 300 test inserts aborted with no shard/endpoint. |
+| One 2PC connection per point doesn't scale to a full frame. | With routing fixed, 95,449 of 115,384 inserts failed with `cannot reach Node 8081`, and the query then failed. The likely cause is running out of the 16,384 ephemeral ports, but `errno` wasn't captured. |
+| The worker's `x < 0` vote rejects real data. | 52,237 of 115,384 points in `000000.bin` have `x < 0`, including 10,790 of the 20,264 inside the query box. |
+| The block reports `[PASS]` with 0 rows, and `main` returns 0 after `[FAIL]`. | The unpatched run printed `[PASS]` with 0 points. The `[FAIL]` run exited 0 and would still print the closing `VERIFIED CLEAN` banner. |
+
+### Follow-up: why KITTI ingestion reported 0 / 115384
+
+`KittiLoader.cpp` has since been written and the shard range widened to the full `uint64_t` range. Every insert still aborted because `main.cpp` registers the shard but never calls `register_node`, so 8081 has no endpoint. This was analysis only, so `main.cpp` is unchanged.
+
+Adding `register_node` in a scratch copy and running the real loader gave 17,234 / 115,384 ingested in 34 s, and the query then failed:
+
+- 82,640 inserts failed with `cannot reach Node 8081`, starting at transaction 16,373. That matches the 16,384 ephemeral ports, and connected transactions (32,744) came to about two full port ranges, which fits ports freeing after the 30 s `TIME_WAIT`. This firms up the port-exhaustion explanation above, though `errno` still wasn't captured.
+- 15,510 inserts were voted down by the `x < 0` rule.
+
+### Follow-up: fixed KITTI ingestion
+
+The full `000000.bin` frame now loads and queries correctly. These changes are uncommitted.
+
+#### The error, in plain terms
+
+There were three separate failures, and each one hid the next:
+
+1. **Missing service registration (a configuration error).** The coordinator knew node 8081 owned the keys, but not its IP address and port.
+2. **Ephemeral port exhaustion, caused by `TIME_WAIT`.** Every TCP connection needs a temporary local port, and macOS has 16,384 of them. A closed connection keeps its port for about 30 s. One connection per point used them all up, so `connect()` began to fail.
+3. **Over-strict validation.** A leftover demo rule treated `x < 0` as invalid, but LiDAR x values are negative for points on one side of the sensor.
+
+#### Decisions
+
+- **Registered the node in `main.cpp`.** This is the direct fix for failure 1.
+- **Added `MortonClient::insert_batch` and load 1,000 points per transaction.** A frame now takes 116 connections instead of 115,384. Reusing one connection would also have helped, but workers serve one connection at a time, so a long-lived client would block everyone else.
+- **Replaced `x < 0` with `coord_in_range`.** The worker now rejects NaN, infinity and values the quantizer would clamp. These are coordinates the index can't store correctly, so the rule is real validation, and it still gives tests a way to force an abort.
+- **Updated the rule's description in `CLAUDE.md` and `README.md`.**
+- **Left the `[PASS]` on 0 rows and exit code 0 on `[FAIL]` alone,** because they weren't part of this request.
+
+#### Verification
+
+| Check | Result |
+|---|---|
+| Full frame | 115,384 / 115,384 ingested in about 3.1 s, up from 17,234 in 34 s |
+| Bounding-box query | 20,264 rows, matching an independent count from the file; all 115,384 points fall in distinct millimetre cells, so none overwrite each other |
+| Validation and batches (throwaway test) | 10 of 10 passed: negative x commits; 5000, -1001, NaN and infinity abort; a batch with one bad point stores nothing |
+| TESTs 0-4 from `a20327a`, unmodified | 15 pass, 3 fail, all tied to `x = -1` being expected to abort |
+| Same tests with those two `-1.0f` inputs changed to `5000.0f` | 18 of 18 pass, exit 0 |
+
+Commit `6d4c44a` replaced those tests in `main.cpp`, so the repo's `main.cpp` no longer runs them. Their results above came from a scratch copy. If they are restored, the two inputs need the same change.
+
+### Follow-up: brought CLAUDE.md up to date
+
+`CLAUDE.md` still described the pre-KITTI project, and its build command no longer linked because it left out `KittiLoader.cpp`. It now covers the KITTI demo, `KittiLoader`, `insert_batch`, `coord_in_range`, the `register_node` requirement and the port limit. It also says how to run TESTs 0-4 from `a20327a`, because a future session would otherwise assume `main.cpp` still runs them. The build command was run as written, and the demo gave 115,384 ingested and 20,264 rows.
+
+### Follow-up: rewrote README.md
+
+The README described a much earlier version of the project, so it was rewritten against the code instead of patched. It said the build might fail, that the WAL had no recovery, and that negative coordinates were folded with `abs()`, none of which is still true. It also left out the SDK, optimizer, failover, shard splitting and KITTI loading. It now leads with the working build, documents the `TIME_WAIT` reason for `insert_batch`, and lists the current limitations. `CLAUDE.md` no longer warns that the README is stale.
+
+### Follow-up: corrected the query box comment
+
+The comments in `main.cpp` called the query box a forward zone, but KITTI's Velodyne axes are x forward, y left, z up, so y in [5, 25] is left of the car. The comments now say that. The box itself is unchanged, by choice, so results stay the same.
+
 ## 2026-11-04: Applied the review fixes
 
 All 16 findings from the review below are addressed. They are committed on the branch `fix/layer5-sdk-cluster-routing` rather than `main`, so you can review them before merging. The `SplitShardPayload` edit in `NetworkProtocol.h` is left out of the commit because it is your own work in progress.

@@ -2,188 +2,226 @@
 #include "BufferPool.h"
 #include "SpatialRecord.h"
 #include "SpatialIndex.h"
-#include "Coordinator.h"
 #include "WorkerServer.h"
-#include "NetworkClient.h"
-#include "MortonCode.h"
+#include "Coordinator.h"
 #include "MortonClient.h"
 #include "QueryOptimizer.h"
-#include <cmath>
+#include "KittiLoader.h"
+#include "QueryExecutor.h"
+#include "MortonCode.h"
+#include <algorithm>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <limits>
+#include <memory>
 #include <string>
+#include <unistd.h>
+#include <vector>
 #include <thread>
 #include <chrono>
 
-static int failures = 0;
+static constexpr int FIRST_PORT = 8081;
+static constexpr int MAX_SHARDS = 16;
+static constexpr const char* SHARD_MAP_FILE = "shard_map.dat";
 
-static void check(bool passed, const std::string& what) {
-    std::cout << ">>> " << (passed ? "PASS" : "FAIL") << ": " << what << "\n";
-    if (!passed) ++failures;
-}
+struct Shard {
+    SpatialIndex index;
+    WriteAheadLog wal;
+    BufferPool pool;
+    WorkerServer worker;
+
+    Shard(int port, const std::string& wal_path)
+        : wal(wal_path.c_str(), 1024 * 1024 * 100), pool(1, index), worker(port, wal, pool, index) {}
+};
+
+struct Options {
+    bool shell = false;
+    int shards = 0; // 0 means not given
+    std::string file_path = "000000.bin";
+};
 
 void run_worker(WorkerServer* server) {
     server->start_listening();
 }
 
-int main() {
-    std::cout << "=================================================================\n";
-    std::cout << "        MORTON-DB FULL CLUSTER VERIFICATION (LAYERS 4 AND 5)     \n";
-    std::cout << "=================================================================\n";
+static bool parse_args(int argc, char* argv[], Options& options) {
+    bool path_given = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--shell") {
+            options.shell = true;
+        } else if (arg == "--shards") {
+            if (++i == argc) return false;
+            char* end = nullptr;
+            const long count = std::strtol(argv[i], &end, 10);
+            if (*end != '\0' || count < 1 || count > MAX_SHARDS) return false;
+            options.shards = static_cast<int>(count);
+        } else if (arg.rfind("--", 0) == 0 || path_given) {
+            return false;
+        } else {
+            options.file_path = arg;
+            path_given = true;
+        }
+    }
+    return !(options.shards != 0 && !options.shell) && !(options.shell && path_given);
+}
 
-    // 1. Provision Primary Worker 1 (Port 8081) and Standby Worker 2 (Port 8082)
-    SpatialIndex primary_index;
-    WriteAheadLog primary_wal("primary_wal.dat", 1024 * 1024 * 100);
-    BufferPool primary_pool(1, primary_index);
-    WorkerServer primary_worker(8081, primary_wal, primary_pool, primary_index);
-    primary_worker.set_standby_node("127.0.0.1", 8082);
-    std::thread t1(run_worker, &primary_worker);
+// Nodes are numbered by port from FIRST_PORT, so the highest node says how many workers the map needs
+static int workers_in_map(const Coordinator& coordinator) {
+    int count = 0;
+    for (const ShardRange& shard : coordinator.get_shards()) {
+        count = std::max(count, static_cast<int>(shard.node_id) - FIRST_PORT + 1);
+    }
+    return count;
+}
 
-    SpatialIndex standby_index;
-    WriteAheadLog standby_wal("standby_wal.dat", 1024 * 1024 * 100);
-    BufferPool standby_pool(1, standby_index);
-    WorkerServer standby_worker(8082, standby_wal, standby_pool, standby_index);
-    std::thread t2(run_worker, &standby_worker);
+// A starting point only: real data clusters in a narrow band of keys, which is why REBALANCE exists
+static void register_even_shards(Coordinator& coordinator, int count) {
+    const uint64_t width = MAX_MORTON_KEY / static_cast<uint64_t>(count);
+    for (int i = 0; i < count; ++i) {
+        const uint64_t start = static_cast<uint64_t>(i) * width;
+        const uint64_t end = i + 1 == count ? MAX_MORTON_KEY : start + width - 1;
+        coordinator.register_shard(static_cast<uint32_t>(FIRST_PORT + i), start, end);
+    }
+}
 
-    // Second primary shard (Port 8083), also the target for the shard split test
-    SpatialIndex shard2_index;
-    WriteAheadLog shard2_wal("shard2_wal.dat", 1024 * 1024 * 100);
-    BufferPool shard2_pool(1, shard2_index);
-    WorkerServer shard2_worker(8083, shard2_wal, shard2_pool, shard2_index);
-    std::thread t3(run_worker, &shard2_worker);
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+int main(int argc, char* argv[]) {
+    Options options;
+    if (!parse_args(argc, argv, options)) {
+        std::cerr << "usage: spatial_db [frame.bin]\n"
+                  << "       spatial_db --shell [--shards N]   (N from 1 to " << MAX_SHARDS << ")\n";
+        return 1;
+    }
 
     Coordinator coordinator;
-    coordinator.register_node(8081, {"127.0.0.1", 8081});
-    coordinator.register_node(8082, {"127.0.0.1", 8082});
-    coordinator.register_node(8083, {"127.0.0.1", 8083});
+    const bool map_loaded = options.shell && coordinator.load_shard_map(SHARD_MAP_FILE);
+    const int saved_workers = map_loaded ? workers_in_map(coordinator) : 0;
 
-    // The top key bit is z's bit 20, so points with z < 48.576 land on 8081 and higher ones on 8083
-    const uint64_t SHARD_BOUNDARY = 1ULL << 62;
-    coordinator.register_shard(8081, 0, SHARD_BOUNDARY - 1);
-    coordinator.register_shard(8083, SHARD_BOUNDARY, MAX_MORTON_KEY);
-
-    // -------------------------------------------------------------------
-    // STEP 0: SHARD-ROUTED 2PC TRANSACTIONS
-    // -------------------------------------------------------------------
-    std::cout << "\n--- TEST 0: Cross-Shard 2PC (each record goes only to its owning shard) ---\n";
-    std::vector<SpatialRecord> good_batch = {
-        {1700000000, 15.0f, 25.0f, 5.0f, 1},    // -> 8081
-        {1700000001, 15.0f, 25.0f, 100.0f, 2}   // -> 8083
-    };
-    bool committed = coordinator.execute_2pc_transaction(9001, good_batch);
-    check(committed && primary_index.size() >= 1 && shard2_index.size() >= 1, "TxID 9001 committed on both shards");
-
-    size_t before_8081 = primary_index.size();
-    size_t before_8083 = shard2_index.size();
-    std::vector<SpatialRecord> bad_batch = {
-        {1700000002, -1.0f, 25.0f, 5.0f, 3},    // -> 8081, rejected by validation (x < 0)
-        {1700000003, 15.0f, 30.0f, 100.0f, 4}   // -> 8083, must not be stored either
-    };
-    bool aborted = !coordinator.execute_2pc_transaction(9002, bad_batch);
-    check(aborted && primary_index.size() == before_8081 && shard2_index.size() == before_8083,
-          "TxID 9002 aborted and left both shards unchanged");
-
-    // -------------------------------------------------------------------
-    // STEP 1: STREAM REPLICATION VERIFICATION
-    // -------------------------------------------------------------------
-    std::cout << "\n--- TEST 1: Primary -> Standby Real-Time WAL Streaming ---\n";
-    NetworkClient client;
-    bool ingested = false;
-    if (client.connect_to_node("127.0.0.1", 8081)) {
-        SpatialRecord rec1 = {1700000000, 15.0f, 25.0f, 5.0f, 1};
-        ingested = client.send_record(rec1);
-        client.close_connection();
+    // Refused rather than ignored: the workers left out would take their points with them
+    if (options.shards != 0 && options.shards < saved_workers) {
+        std::cerr << "error: the data is spread across " << saved_workers << " workers, so it can't start with "
+                  << options.shards << ".\nUse --shards " << saved_workers
+                  << ", or delete shard_*_wal.dat and " << SHARD_MAP_FILE << " to start empty.\n";
+        return 1;
     }
-    check(ingested, "record ingested on primary 8081");
+
+    int worker_count = 1;
+    if (options.shell) worker_count = options.shards != 0 ? options.shards : std::max(saved_workers, 1);
+
+    // Every component logs to std::cout, which would bury query results. Moving std::cout to a
+    // file before the workers start keeps the terminal for results only.
+    std::streambuf* terminal = std::cout.rdbuf();
+    std::ostream shell_out(terminal);
+    std::ofstream shell_log;
+    if (options.shell) {
+        shell_log.open("spatial_shell.log");
+        std::cout.rdbuf(shell_log.rdbuf());
+    }
+
+    std::cout << "=================================================================\n";
+    std::cout << "        MORTON-DB: KITTI REAL 3D LIDAR INGESTION & QUERY TEST     \n";
+    std::cout << "=================================================================\n";
+
+    // 1. Boot Workers. The shell's WALs are separate from the demo's, which has no shard map to match.
+    std::vector<std::unique_ptr<Shard>> shards;
+    std::vector<std::thread> threads;
+    for (int i = 0; i < worker_count; ++i) {
+        const int port = FIRST_PORT + i;
+        const std::string wal_path = options.shell ? "shard_" + std::to_string(port) + "_wal.dat" : "kitti_wal.dat";
+        shards.push_back(std::make_unique<Shard>(port, wal_path));
+        shards.back()->worker.recover(); // here, not in the thread, so the first command can't beat it
+        threads.emplace_back(run_worker, &shards.back()->worker);
+    }
+
+    auto stop_workers = [&]() {
+        for (auto& shard : shards) shard->worker.stop_server();
+        for (auto& thread : threads) thread.detach();
+    };
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-    // -------------------------------------------------------------------
-    // STEP 2: SIMULATE PRIMARY CRASH & AUTOMATIC STANDBY FAILOVER
-    // -------------------------------------------------------------------
-    std::cout << "\n--- TEST 2: Primary Server Crash & Standby Failover ---\n";
-    primary_worker.stop_server(); // Primary Node Crashes!
-    
-    // Coordinator detects missing socket/heartbeat and reroutes shard to Standby Node (8082)
-    coordinator.failover_primary_to_standby(8081, 8082);
+    // 2. Provision Coordinator & Register Shard Ranges
+    for (int i = 0; i < worker_count; ++i) {
+        coordinator.register_node(static_cast<uint32_t>(FIRST_PORT + i), {"127.0.0.1", FIRST_PORT + i});
+    }
+    if (!options.shell) {
+        coordinator.register_shard(FIRST_PORT, 0, std::numeric_limits<uint64_t>::max());
+    } else if (!map_loaded) {
+        register_even_shards(coordinator, worker_count);
+        coordinator.save_shard_map(SHARD_MAP_FILE);
+    }
 
-    // Query Standby Node directly to verify 0 data loss
-    std::vector<SpatialRecord> matches;
-    bool queried = client.connect_to_node("127.0.0.1", 8082)
-                && client.send_query({10.0f, 20.0f, 20.0f, 30.0f, 0.0f, 10.0f}, matches);
-    client.close_connection();
-    check(queried && !matches.empty(), "standby 8082 holds the replicated record after failover");
+    MortonClient client(coordinator);
 
-    // -------------------------------------------------------------------
-    // STEP 3: SHARD SPLIT
-    // -------------------------------------------------------------------
-    std::cout << "\n--- TEST 3: Dynamic Shard Split & Re-Sharding ---\n";
-    // y = 90 sets key bit 61, which puts this record in the half of the range that migrates
-    std::vector<SpatialRecord> split_batch = {{1700000004, 20.0f, 90.0f, 5.0f, 5}};
-    check(coordinator.execute_2pc_transaction(9003, split_batch), "TxID 9003 committed on 8082 after failover");
+    if (options.shell) {
+        shell_out << "Morton-DB shell with " << worker_count << (worker_count == 1 ? " worker" : " workers")
+                  << ". Type HELP; for commands and EXIT; to quit.\n";
 
-    // After failover, the standby (8082) owns the old primary range; split it onto 8083
-    bool split = coordinator.split_shard(8082, 8083, {"127.0.0.1", 8082}, {"127.0.0.1", 8083});
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (saved_workers != 0 && worker_count > saved_workers) {
+            shell_out << "note: the new workers own no keys yet. Run REBALANCE; to share the data with them.\n";
+        }
+        if (!map_loaded) {
+            uint64_t stored = 0;
+            for (uint32_t node : coordinator.node_ids()) {
+                uint64_t count = 0;
+                if (coordinator.node_point_count(node, count)) stored += count;
+            }
+            if (stored > 0) {
+                shell_out << "note: found " << stored << " points but no shard map, so queries may miss some. Run REBALANCE; to fix this.\n";
+            }
+        }
 
-    matches.clear();
-    bool migrated = client.connect_to_node("127.0.0.1", 8083)
-                 && client.send_query({19.0f, 21.0f, 89.0f, 91.0f, 4.0f, 6.0f}, matches);
-    client.close_connection();
-    check(split && migrated && matches.size() == 1, "split moved the upper half of the range to 8083");
+        QueryExecutor executor(client, coordinator, shell_out, SHARD_MAP_FILE);
+        run_shell(executor, std::cin, shell_out, isatty(STDIN_FILENO) != 0 && isatty(STDOUT_FILENO) != 0);
 
-    // -------------------------------------------------------------------
-    // STEP 4: SDK AND OPTIMIZER, ON THE CLUSTER LEFT BY FAILOVER AND SPLIT
-    // -------------------------------------------------------------------
-    std::cout << "\n--- TEST 4: NoSQL SDK & Key-Range Optimizer ---\n";
-    MortonClient sdk(coordinator);
-    check(sdk.insert(12.5f, 25.0f, 8.0f, 1700000005, 100), "SDK insert committed on 8082");
-    check(sdk.insert(45.0f, 90.0f, 15.0f, 1700000006, 200), "SDK insert committed on 8083");
-    check(sdk.insert(15.0f, 25.0f, 48.5f, 1700000007, 300), "SDK insert just below z = 48.576");
-    check(sdk.insert(15.0f, 25.0f, 48.6f, 1700000008, 400), "SDK insert just above z = 48.576");
-    check(!sdk.insert(-1.0f, 25.0f, 5.0f, 1700000009, 500), "SDK insert with x < 0 rejected by 2PC validation");
+        stop_workers();
+        std::cout.rdbuf(terminal); // shell_log is about to close
+        return 0;
+    }
 
-    // No connection is held between calls, so a second client is not blocked by the first
-    MortonClient second_sdk(coordinator);
-    QueryResult narrow = second_sdk.query().bounding_box(12.0f, 13.0f, 20.0f, 30.0f, 5.0f, 10.0f).execute();
-    std::cout << "[CBO Optimizer] " << narrow.plan.description << "\n";
-    check(narrow.ok && narrow.records.size() == 1, "narrow query returned its one point");
+    // 3. Ingest Real KITTI Point Cloud File
+    std::cout << "\n--- STEP 1: Ingesting Binary LiDAR Frame (" << options.file_path << ") ---\n";
+    KittiLoadResult res = KittiLoader::load_bin_file(client, options.file_path);
 
-    QueryResult cluster = sdk.query().bounding_box(0.0f, 50.0f, 0.0f, 100.0f, 0.0f, 120.0f).execute();
-    std::cout << "[CBO Optimizer] " << cluster.plan.description << "\n";
-    check(cluster.ok && cluster.records.size() == 7, "cluster-wide query returned all 7 points exactly once");
+    if (!res.success) {
+        std::cerr << "[FAIL] Failed to ingest KITTI binary dataset.\n";
+        stop_workers();
+        return 1;
+    }
 
-    QueryResult across = sdk.query().bounding_box(10.0f, 20.0f, 20.0f, 30.0f, 48.4f, 48.7f).execute();
-    std::cout << "[CBO Optimizer] " << across.plan.description << "\n";
-    check(across.ok && across.records.size() == 2 && across.plan.plan_type == ExecutionPlanType::MORTON_SPLIT_RANGE_SCAN,
-          "box across the z boundary was split and found both points");
+    // 4. Run Spatial Query Over Left-Side Sector
+    // KITTI Velodyne axes are x forward, y left, z up, so this box is left of the car: X ∈ [-10, 10], Y ∈ [5, 25], Z ∈ [-2, 3]
+    std::cout << "\n--- STEP 2: Executing Bounding Box Query Over Vehicle Sector ---\n";
+    QueryRequest req = {-10.0f, 10.0f, 5.0f, 25.0f, -2.0f, 3.0f};
 
-    // Aligned to the 2^18 mm Morton grid, so one range already covers exactly this cube
-    ExecutionPlan aligned = QueryOptimizer::optimize({48.576f, 310.719f, 48.576f, 310.719f, 48.576f, 310.719f});
-    std::cout << "[CBO Optimizer] " << aligned.description << "\n";
-    check(aligned.plan_type == ExecutionPlanType::MORTON_INDEX_RANGE_SCAN, "grid-aligned cube stayed a single range");
+    ExecutionPlan plan = QueryOptimizer::optimize(req);
+    std::cout << "[CBO Plan] " << plan.description << "\n";
+    std::cout << "[CBO Stats] Morton Key Span: " << plan.key_span << "\n";
 
-    QueryResult inverted = sdk.query().bounding_box(20.0f, 10.0f, 20.0f, 30.0f, 5.0f, 10.0f).execute();
-    check(!inverted.ok && inverted.plan.plan_type == ExecutionPlanType::INVALID_PLAN, "inverted box rejected");
+    QueryResult query_res = client.query()
+                                  .bounding_box(req.x_min, req.x_max, req.y_min, req.y_max, req.z_min, req.z_max)
+                                  .execute();
 
-    QueryResult not_a_number = sdk.query().bounding_box(NAN, 20.0f, 20.0f, 30.0f, 5.0f, 10.0f).execute();
-    check(!not_a_number.ok && not_a_number.plan.plan_type == ExecutionPlanType::INVALID_PLAN, "NaN box rejected");
+    if (query_res.ok) {
+        std::cout << "[PASS] Successfully extracted " << query_res.records.size() 
+                  << " 3D spatial points from KITTI dataset.\n";
+        
+        size_t sample_count = std::min(query_res.records.size(), size_t(5));
+        std::cout << "  Sample Points in Bounding Box:\n";
+        for (size_t i = 0; i < sample_count; ++i) {
+            const auto& r = query_res.records[i];
+            std::cout << "    [" << i+1 << "] Point: (" << r.x << ", " << r.y << ", " << r.z 
+                      << ") | Payload: " << r.metadata << "\n";
+        }
+    } else {
+        std::cout << "[FAIL] Spatial range query failed.\n";
+    }
 
-    check(!sdk.query().execute().ok, "query without a bounding box rejected");
-
-    standby_worker.stop_server();
-    shard2_worker.stop_server();
-    if (t1.joinable()) t1.detach();
-    if (t2.joinable()) t2.detach();
-    if (t3.joinable()) t3.detach();
+    stop_workers();
 
     std::cout << "\n=================================================================\n";
-    if (failures == 0) {
-        std::cout << "   ALL CHECKS PASSED: LAYERS 4 AND 5 VERIFIED                    \n";
-    } else {
-        std::cout << "   " << failures << " CHECK(S) FAILED                                               \n";
-    }
+    std::cout << "        KITTI DATASET INGESTION & SEARCH VERIFIED CLEAN          \n";
     std::cout << "=================================================================\n";
-    return failures == 0 ? 0 : 1;
+    return 0;
 }

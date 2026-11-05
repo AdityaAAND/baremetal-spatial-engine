@@ -1,5 +1,6 @@
 #include "WorkerServer.h"
 #include "NetworkProtocol.h"
+#include "MortonCode.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -7,6 +8,101 @@
 #include <iostream>
 #include <cerrno>
 #include <cstring>
+#include <sys/time.h>
+
+// Long enough for the target to apply a whole shard, which it does before answering the heartbeat
+static constexpr int MIGRATE_ACK_TIMEOUT_SEC = 30;
+
+#ifdef MSG_NOSIGNAL
+static constexpr int SEND_FLAGS = MSG_NOSIGNAL;
+#else
+static constexpr int SEND_FLAGS = 0;
+#endif
+
+// A peer that has gone must produce a failed send, not kill the whole process with SIGPIPE
+static void suppress_sigpipe(int fd) {
+#ifdef SO_NOSIGPIPE
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#else
+    (void)fd;
+#endif
+}
+
+static bool send_all(int fd, const void* data, size_t len) {
+    const char* cursor = static_cast<const char*>(data);
+    while (len > 0) {
+        ssize_t sent = send(fd, cursor, len, SEND_FLAGS);
+        if (sent <= 0) return false;
+        cursor += sent;
+        len -= static_cast<size_t>(sent);
+    }
+    return true;
+}
+
+// True only once the target has applied every record. CMD_INGEST has no reply, but a worker handles
+// a connection in order, so its ACK to the trailing heartbeat proves the records before it went in.
+static bool send_records_to(const char* ip, int target_port, const std::vector<SpatialRecord>& records) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return false;
+    suppress_sigpipe(sock);
+
+    timeval timeout{MIGRATE_ACK_TIMEOUT_SEC, 0};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(target_port));
+    inet_pton(AF_INET, ip, &addr.sin_addr);
+
+    // One buffer rather than a send per field, which would stall on Nagle for every small write
+    const PacketHeader ingest = {CMD_INGEST, sizeof(SpatialRecord)};
+    const PacketHeader heartbeat = {CMD_HEARTBEAT, 0};
+    std::vector<char> buffer;
+    buffer.reserve(records.size() * (sizeof(ingest) + sizeof(SpatialRecord)) + sizeof(heartbeat));
+    auto append = [&](const void* data, size_t len) {
+        const char* bytes = static_cast<const char*>(data);
+        buffer.insert(buffer.end(), bytes, bytes + len);
+    };
+    for (const auto& rec : records) {
+        append(&ingest, sizeof(ingest));
+        append(&rec, sizeof(rec));
+    }
+    append(&heartbeat, sizeof(heartbeat));
+
+    PacketHeader ack{};
+    const bool confirmed = connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0
+        && send_all(sock, buffer.data(), buffer.size())
+        && recv(sock, &ack, sizeof(ack), MSG_WAITALL) == static_cast<ssize_t>(sizeof(ack))
+        && ack.command == CMD_ACK;
+    close(sock);
+    return confirmed;
+}
+
+static bool passes_filters(const SpatialRecord& rec, const FilteredQueryRequest& req) {
+    for (uint8_t i = 0; i < req.filter_count; ++i) {
+        const uint32_t value = req.filters[i].value;
+        bool passed = false;
+        switch (req.filters[i].op) {
+            case FILTER_EQ: passed = rec.metadata == value; break;
+            case FILTER_NE: passed = rec.metadata != value; break;
+            case FILTER_LT: passed = rec.metadata < value; break;
+            case FILTER_LE: passed = rec.metadata <= value; break;
+            case FILTER_GT: passed = rec.metadata > value; break;
+            case FILTER_GE: passed = rec.metadata >= value; break;
+        }
+        if (!passed) return false;
+    }
+    return true;
+}
+
+static bool valid_filtered_query(const FilteredQueryRequest& req) {
+    if (req.filter_count > MAX_QUERY_FILTERS) return false;
+    for (uint8_t i = 0; i < req.filter_count; ++i) {
+        if (req.filters[i].op > FILTER_GE) return false;
+    }
+    return true;
+}
 
 WorkerServer::WorkerServer(int port, WriteAheadLog& wal_ref, BufferPool& pool_ref, SpatialIndex& index_ref)
     : server_fd(-1), port(port), wal(wal_ref), pool(pool_ref), index(index_ref), has_standby(false), standby_port(0), recovered(false) {}
@@ -38,6 +134,9 @@ size_t WorkerServer::recover() {
             }
             case LOG_ABORT:
                 pending.erase(e.tx_id);
+                break;
+            case LOG_REMOVE_RANGE:
+                applied -= index.extract_and_remove_range(e.tx_id, e.rec.timestamp).size();
                 break;
         }
     });
@@ -109,6 +208,7 @@ void WorkerServer::start_listening() {
     while (true) {
         int client_fd = accept(server_fd, nullptr, nullptr);
         if (client_fd < 0) break;
+        suppress_sigpipe(client_fd);
 
         PacketHeader header;
         while (recv(client_fd, &header, sizeof(PacketHeader), MSG_WAITALL) > 0) {
@@ -132,7 +232,8 @@ void WorkerServer::start_listening() {
                 TxPacket tx_pkt;
                 recv(client_fd, &tx_pkt, sizeof(TxPacket), MSG_WAITALL);
 
-                if (tx_pkt.record.x < 0.0f) {
+                const SpatialRecord& rec = tx_pkt.record;
+                if (!coord_in_range(rec.x) || !coord_in_range(rec.y) || !coord_in_range(rec.z)) {
                     PacketHeader resp = {CMD_VOTE_ABORT, 0};
                     send(client_fd, &resp, sizeof(PacketHeader), 0);
                 } else {
@@ -190,29 +291,20 @@ void WorkerServer::start_listening() {
                 bool migrated_ok = true;
 
                 if (!records_to_migrate.empty()) {
-                    int dest_sock = socket(AF_INET, SOCK_STREAM, 0);
-                    sockaddr_in dest_addr{};
-                    dest_addr.sin_family = AF_INET;
-                    dest_addr.sin_port = htons(static_cast<uint16_t>(payload.target_port));
-                    inet_pton(AF_INET, target_ip, &dest_addr.sin_addr);
-
-                    if (dest_sock >= 0 && connect(dest_sock, (struct sockaddr*)&dest_addr, sizeof(dest_addr)) == 0) {
-                        for (const auto& rec : records_to_migrate) {
-                            PacketHeader ingest_header = {CMD_INGEST, sizeof(SpatialRecord)};
-                            send(dest_sock, &ingest_header, sizeof(PacketHeader), 0);
-                            send(dest_sock, &rec, sizeof(SpatialRecord), 0);
+                    migrated_ok = send_records_to(target_ip, static_cast<int>(payload.target_port), records_to_migrate);
+                    if (migrated_ok) {
+                        if (!wal.append_remove_range(payload.min_key, payload.max_key)) {
+                            std::cerr << "[Worker Node " << port << "] WAL full: migrated records will reappear here after a restart\n";
                         }
                         std::cout << "[Worker Node " << port << "] Successfully migrated "
                                   << records_to_migrate.size() << " records to Node " << payload.target_port << "\n";
                     } else {
-                        // Target unreachable: put the records back so they are not lost
+                        // The target may hold some of them, but only this copy is known to be complete
                         for (const auto& rec : records_to_migrate) index.insert(rec);
-                        migrated_ok = false;
-                        std::cout << "[Worker Node " << port << "] Migration failed: cannot reach "
+                        std::cout << "[Worker Node " << port << "] Migration failed: no confirmation from "
                                   << target_ip << ":" << payload.target_port << " -> restored "
                                   << records_to_migrate.size() << " records locally\n";
                     }
-                    if (dest_sock >= 0) close(dest_sock);
                 }
 
                 // CMD_ABORT acts as a NACK so the Coordinator leaves its shard map unchanged
@@ -229,6 +321,42 @@ void WorkerServer::start_listening() {
                 if (!results.empty()) {
                     send(client_fd, results.data(), resp_header.payload_len, 0);
                 }
+            }
+            else if (header.command == CMD_HEARTBEAT) {
+                PacketHeader resp = {CMD_ACK, 0};
+                if (!send_all(client_fd, &resp, sizeof(resp))) break;
+            }
+            else if (header.command == CMD_GET_KEYS) {
+                const std::vector<uint64_t> keys = index.keys();
+                const uint32_t payload_len = static_cast<uint32_t>(keys.size() * sizeof(uint64_t));
+                PacketHeader resp = {CMD_KEYS_RESP, payload_len};
+                if (!send_all(client_fd, &resp, sizeof(resp))) break;
+                if (payload_len > 0 && !send_all(client_fd, keys.data(), payload_len)) break;
+            }
+            else if (header.command == CMD_QUERY_FILTERED) {
+                FilteredQueryRequest req;
+                // Closing is the failure reply: the client treats a dropped connection as a failed query
+                if (recv(client_fd, &req, sizeof(req), MSG_WAITALL) != static_cast<ssize_t>(sizeof(req))
+                    || !valid_filtered_query(req)) {
+                    break;
+                }
+
+                std::vector<SpatialRecord> results;
+                uint64_t matched = 0;
+                const QueryRequest& box = req.box;
+                index.scan_box(box.x_min, box.x_max, box.y_min, box.y_max, box.z_min, box.z_max, [&](const SpatialRecord& rec) {
+                    if (!passes_filters(rec, req)) return true;
+                    ++matched;
+                    if (!req.count_only) results.push_back(rec);
+                    return req.limit == 0 || matched < req.limit;
+                });
+
+                const void* payload = req.count_only ? static_cast<const void*>(&matched) : results.data();
+                const uint32_t payload_len = req.count_only ? static_cast<uint32_t>(sizeof(matched))
+                                                            : static_cast<uint32_t>(results.size() * sizeof(SpatialRecord));
+                PacketHeader resp_header = {static_cast<uint8_t>(req.count_only ? CMD_COUNT_RESP : CMD_QUERY_RESP), payload_len};
+                if (send(client_fd, &resp_header, sizeof(PacketHeader), 0) != static_cast<ssize_t>(sizeof(PacketHeader))) break;
+                if (payload_len > 0 && send(client_fd, payload, payload_len, 0) != static_cast<ssize_t>(payload_len)) break;
             }
         }
         close(client_fd);

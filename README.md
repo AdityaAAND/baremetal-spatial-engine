@@ -1,31 +1,59 @@
 # Distributed Spatial Database (Advanced DBMS Project)
 
-A small C++17 prototype of a sharded, crash-aware spatial database for 3D point data (for example mmWave radar returns). It layers a memory-mapped write-ahead log, a buffered Z-order (Morton) index, a TCP wire protocol, and a two-phase-commit coordinator.
+A small C++17 prototype of a sharded spatial database for 3D point data, such as mmWave radar returns and LiDAR scans. It combines a memory-mapped write-ahead log, a Z-order (Morton) index, a TCP worker per shard, two-phase commit, primary-to-standby replication, failover, shard splitting, a client SDK with a query optimizer, and a loader for real KITTI LiDAR frames.
 
-> Status: prototype / coursework. POSIX only (macOS/Linux). See [Known limitations](#known-limitations).
+> Status: prototype / coursework. POSIX only (macOS/Linux), with no dependencies. See [Known limitations](#known-limitations).
+
+## Quick start
+
+There is no build system. With a C++17 compiler on macOS or Linux:
+
+```bash
+g++ -std=c++17 -O2 -Wall -pthread -o spatial_db \
+    main.cpp Coordinator.cpp NetworkClient.cpp WorkerServer.cpp \
+    BufferPool.cpp SpatialIndex.cpp MortonCode.cpp WriteAheadLog.cpp \
+    MortonClient.cpp QueryOptimizer.cpp KittiLoader.cpp
+
+rm -f kitti_wal.dat   # for a clean run: existing WAL files are replayed on startup
+./spatial_db          # or: ./spatial_db path/to/frame.bin (default 000000.bin)
+```
+
+The demo needs port 8081 free and a KITTI Velodyne frame. `000000.bin` is not in the repository, so supply your own copy. The demo starts one in-process worker, ingests the frame, and runs a bounding-box query over x ∈ [-10, 10], y ∈ [5, 25], z ∈ [-2, 3]. With the 115,384-point frame used during development, the output ends with:
+
+```
+-> Points Ingested: 115384 / 115384
+[PASS] Successfully extracted 20264 3D spatial points from KITTI dataset.
+```
+
+Ingestion took about 3 seconds on the development Mac. The run creates `kitti_wal.dat` (100 MB), which is a generated file and should not be committed.
 
 ## Architecture
 
 ```
-            ┌────────────────────────────┐
-            │        Coordinator         │  2PC driver, Morton-range shard routing
-            └──────┬──────────────┬──────┘
-        TCP (binary protocol)     │
-        ┌──────────▼───┐   ┌──────▼───────┐
-        │ WorkerServer │   │ WorkerServer │   one per shard
-        │   :8081      │   │   :8082      │
-        │ ┌──────────┐ │   │ ┌──────────┐ │
-        │ │BufferPool│ │   │ │BufferPool│ │   batches inserts
-        │ └────┬─────┘ │   │ └────┬─────┘ │
-        │ ┌────▼─────┐ │   │ ┌────▼─────┐ │
-        │ │SpatialIdx│ │   │ │SpatialIdx│ │   std::map keyed by Z-order code
-        │ └──────────┘ │   │ └──────────┘ │
-        │ ┌──────────┐ │   │ ┌──────────┐ │
-        │ │   WAL    │ │   │ │   WAL    │ │   mmap-backed append-only file
-        │ └──────────┘ │   │ └──────────┘ │
-        └──────┬───────┘   └──────────────┘
-               │ CMD_REPLICATE (optional)
-        ┌──────▼───────┐
+        ┌───────────────────────────────┐
+        │  Application / KittiLoader    │
+        └───────────────┬───────────────┘
+                        │ insert, insert_batch, query()
+        ┌───────────────▼───────────────┐
+        │ MortonClient + QueryOptimizer │  SDK, plans each query
+        └───────────────┬───────────────┘
+                        │
+        ┌───────────────▼───────────────┐
+        │          Coordinator          │  shard map, 2PC, split, failover
+        └───────┬───────────────┬───────┘
+                │  TCP (binary protocol)
+        ┌───────▼──────┐ ┌──────▼───────┐
+        │ WorkerServer │ │ WorkerServer │  one per shard
+        │ ┌──────────┐ │ │ ┌──────────┐ │
+        │ │   WAL    │ │ │ │   WAL    │ │  mmap'd log, replayed on startup
+        │ ├──────────┤ │ │ ├──────────┤ │
+        │ │BufferPool│ │ │ │BufferPool│ │  batches inserts
+        │ ├──────────┤ │ │ ├──────────┤ │
+        │ │SpatialIdx│ │ │ │SpatialIdx│ │  std::map keyed by Z-order code
+        │ └──────────┘ │ │ └──────────┘ │
+        └───────┬──────┘ └──────────────┘
+                │ CMD_REPLICATE (optional)
+        ┌───────▼──────┐
         │ Standby node │
         └──────────────┘
 ```
@@ -33,20 +61,75 @@ A small C++17 prototype of a sharded, crash-aware spatial database for 3D point 
 | Layer | Files | Responsibility |
 |---|---|---|
 | Record | [SpatialRecord.h](SpatialRecord.h) | Packed 24-byte record: `timestamp`, `x`, `y`, `z`, `metadata` |
-| Storage | [WriteAheadLog.h](WriteAheadLog.h), [WriteAheadLog.cpp](WriteAheadLog.cpp) | `mmap`'d fixed-size file; `append` claims a slot with an atomic counter |
-| Buffering | [BufferPool.h](BufferPool.h), [BufferPool.cpp](BufferPool.cpp) | Mutex-protected batch; flushes to the index when it reaches capacity |
-| Index | [SpatialIndex.h](SpatialIndex.h), [SpatialIndex.cpp](SpatialIndex.cpp), [MortonCode.cpp](MortonCode.cpp) | Coordinates are quantized (×1000), interleaved into a 63-bit Z-order key, stored in a `std::map` |
-| Cluster | [Coordinator.h](Coordinator.h), [Coordinator.cpp](Coordinator.cpp), [NodeConfig.h](NodeConfig.h) | Morton-range shard table, query routing, 2PC coordination |
-| Network | [NetworkProtocol.h](NetworkProtocol.h), [NetworkClient.h](NetworkClient.h), [NetworkClient.cpp](NetworkClient.cpp), [WorkerServer.h](WorkerServer.h), [WorkerServer.cpp](WorkerServer.cpp) | Packed binary protocol over POSIX TCP; worker request loop |
-| Demo | [main.cpp](main.cpp) | Starts two workers in-process and runs one cross-shard 2PC transaction |
+| Storage | [WriteAheadLog.h](WriteAheadLog.h), [WriteAheadLog.cpp](WriteAheadLog.cpp) | Fixed-size `mmap` file with a header and typed entries; appends are mutex-guarded and fail when the log is full |
+| Buffering | [BufferPool.h](BufferPool.h), [BufferPool.cpp](BufferPool.cpp) | Batches records and flushes them to the index at capacity |
+| Index | [SpatialIndex.h](SpatialIndex.h), [SpatialIndex.cpp](SpatialIndex.cpp), [MortonCode.h](MortonCode.h), [MortonCode.cpp](MortonCode.cpp) | Quantizes coordinates to millimetres, interleaves them into a 63-bit Z-order key, and stores records in a `std::map` with range queries |
+| Cluster | [Coordinator.h](Coordinator.h), [Coordinator.cpp](Coordinator.cpp), [NodeConfig.h](NodeConfig.h) | Shard map, routing, 2PC, cross-shard queries, shard splitting, failover |
+| Network | [NetworkProtocol.h](NetworkProtocol.h), [NetworkClient.h](NetworkClient.h), [NetworkClient.cpp](NetworkClient.cpp), [WorkerServer.h](WorkerServer.h), [WorkerServer.cpp](WorkerServer.cpp) | Packed binary protocol over POSIX TCP; WAL recovery and the worker request loop |
+| SDK | [MortonClient.h](MortonClient.h), [MortonClient.cpp](MortonClient.cpp), [QueryOptimizer.h](QueryOptimizer.h), [QueryOptimizer.cpp](QueryOptimizer.cpp) | Client API and key-range query planning |
+| Dataset | [KittiLoader.h](KittiLoader.h), [KittiLoader.cpp](KittiLoader.cpp) | Reads KITTI `.bin` frames and loads them in batches |
+| Demo | [main.cpp](main.cpp) | Single-worker KITTI ingestion and query |
+
+## Using the SDK
+
+`MortonClient` goes through the `Coordinator`, so writes get routing and 2PC, and reads cover every shard. A node must be registered twice: `register_node` gives its address and `register_shard` gives the keys it owns.
+
+```cpp
+Coordinator coordinator;
+coordinator.register_node(8081, {"127.0.0.1", 8081});
+coordinator.register_shard(8081, 0, MAX_MORTON_KEY);
+
+MortonClient client(coordinator);
+
+client.insert(1.5f, 2.5f, 3.5f);   // one record, one transaction
+client.insert_batch(records);      // many records, one all-or-nothing transaction
+
+QueryResult result = client.query()
+                           .bounding_box(-10, 10, 5, 25, -2, 3)
+                           .execute();
+if (result.ok) { /* use result.records */ }
+```
+
+Use `insert_batch` for bulk loads. Each transaction opens a TCP connection, and a closed connection holds its local port in `TIME_WAIT` for about 30 seconds. One `insert` per point therefore runs out of ephemeral ports after roughly 16,000 transactions on macOS, and later inserts and queries fail. `KittiLoader` sends 1,000 points per transaction, so a 115,384-point frame needs 116 connections.
+
+## How it works
+
+### Routing
+
+A coordinate is quantized with `(v + 1000) * 1000`, then its three 21-bit values are interleaved into a Z-order key. Each shard owns an inclusive key range, and the coordinator finds the owner with a linear scan. Quantization is monotone, so every point in a box has a key between the keys of the box's two corners.
+
+### Two-phase commit
+
+`Coordinator::execute_2pc_transaction` groups records by owning shard and refuses the whole transaction if any record can't be routed.
+
+1. **Prepare:** the coordinator sends one `CMD_PREPARE` per record, only to the owning shards. The worker votes abort if a coordinate is NaN, infinite or outside the quantizer's range of about [-1000, 1097]. Otherwise it stages the record in memory and votes commit.
+2. **Commit or abort:** if every vote is commit, each worker writes its staged records to the WAL, inserts them into the buffer pool, and forwards them to its standby. A missing ACK is retried once on a fresh connection, which is safe because commit is idempotent. If any vote is abort, every connected worker discards the staged records, so one bad point aborts the whole batch.
+
+### Queries
+
+`QueryOptimizer::optimize` returns one of three plans: a single key range, up to 8 disjoint sub-boxes, or `INVALID_PLAN` for an inverted or NaN box. It splits the box only when that cuts the total key span at least 4x. `Coordinator::execute_query` asks each overlapping shard once per sub-box, and if any shard fails, the whole query fails rather than returning partial rows.
+
+### Replication and failover
+
+`WorkerServer::set_standby_node(ip, port)` gives a worker a standby. After a local ingest or commit, the primary sends each record as `CMD_REPLICATE`, and the standby writes it to its own WAL and index without forwarding it. There is no acknowledgement.
+
+`failover_primary_to_standby` remaps the failed node's shards to the standby in the coordinator's shard map. It does not detect failures, so something else has to call it.
+
+### Shard splitting
+
+`split_shard` halves the old node's key range and sends `CMD_MIGRATE_RANGE`. The old worker extracts the upper half and sends it to the target. If the target can't be reached, the worker restores the records and replies with a NACK. The coordinator updates the shard map only after an ACK.
+
+### Recovery
+
+On startup, a worker replays its WAL into the index. An unrecognised WAL header reinitialises the log and discards its contents.
 
 ## Wire protocol
 
-Every message is a packed `PacketHeader` (`uint8_t command`, `uint32_t payload_len`) followed by a fixed-size struct. Defined in [NetworkProtocol.h](NetworkProtocol.h).
+Every message is a packed `PacketHeader` (`uint8_t command`, `uint32_t payload_len`) followed by a fixed-size struct, as defined in [NetworkProtocol.h](NetworkProtocol.h). Byte order is host-endian, so both ends must share an architecture.
 
 | Command | Code | Direction | Payload |
 |---|---|---|---|
-| `CMD_INGEST` | 0x01 | client → worker | `SpatialRecord` (applied immediately, no 2PC) |
+| `CMD_INGEST` | 0x01 | client → worker | `SpatialRecord`, applied immediately with no 2PC or reply |
 | `CMD_QUERY` | 0x02 | client → worker | `QueryRequest` (x/y/z min/max) |
 | `CMD_QUERY_RESP` | 0x03 | worker → client | array of `SpatialRecord` |
 | `CMD_ACK` | 0x04 | worker → coordinator | none |
@@ -54,49 +137,35 @@ Every message is a packed `PacketHeader` (`uint8_t command`, `uint32_t payload_l
 | `CMD_VOTE_COMMIT` | 0x06 | worker → coordinator | none |
 | `CMD_VOTE_ABORT` | 0x07 | worker → coordinator | none |
 | `CMD_COMMIT` | 0x08 | coordinator → worker | `uint64_t tx_id` |
-| `CMD_ABORT` | 0x09 | coordinator → worker | `uint64_t tx_id` |
-| `CMD_REPLICATE` | 0x0A | primary → standby | `SpatialRecord` |
+| `CMD_ABORT` | 0x09 | coordinator → worker | `uint64_t tx_id`; also the NACK for a failed migration |
+| `CMD_REPLICATE` | 0x0A | primary → standby | `SpatialRecord`, no reply |
+| `CMD_MIGRATE_RANGE` | 0x0B | coordinator → worker | `MigrateRangePayload` (key range + target address) |
+| `CMD_HEARTBEAT` | 0x0C | not implemented | declared but not handled |
+| `CMD_SPLIT_SHARD` | 0x0D | not implemented | declared but not handled |
 
-## Two-phase commit
+## Testing
 
-Driven by `Coordinator::execute_2pc_transaction` ([Coordinator.cpp](Coordinator.cpp)):
+There are no unit tests, and [main.cpp](main.cpp) only exercises the single-worker KITTI path. Its output is not a strict check, because it prints `[PASS]` for 0 rows and exits 0 after a failed query, so compare the printed counts.
 
-1. **Phase 1 (prepare):** the coordinator connects to each participant and sends `CMD_PREPARE`. The worker validates the record. If `x < 0` it replies `CMD_VOTE_ABORT` and stages nothing. Otherwise it stages the record in memory (`staged_tx`) and replies `CMD_VOTE_COMMIT`.
-2. **Phase 2:** if every vote is commit, the coordinator sends `CMD_COMMIT`, and each worker appends the staged record to its WAL, inserts it into the buffer pool, forwards it to its standby (if any), and replies `CMD_ACK`. Otherwise the coordinator sends `CMD_ABORT` and workers discard the staged record.
-
-## Replication
-
-A worker can be given a standby with `WorkerServer::set_standby_node(ip, port)`. After a local `CMD_INGEST` or `CMD_COMMIT`, the primary opens a connection and sends the record as `CMD_REPLICATE`. The standby appends it to its own WAL and index without forwarding it again. This is best-effort shipping, not full streaming replication (see limitations).
-
-## Build and run
-
-There is no build system yet. With a C++17 compiler on macOS or Linux:
-
-```bash
-g++ -std=c++17 -O2 -pthread -o spatial_db \
-    main.cpp Coordinator.cpp NetworkClient.cpp WorkerServer.cpp \
-    BufferPool.cpp SpatialIndex.cpp MortonCode.cpp WriteAheadLog.cpp
-
-./spatial_db
-```
-
-The demo starts workers on ports 8081 and 8082, runs transaction `9001` with a record at `(45, 90, 15)`, and prints the coordinator and worker log lines for each phase, ending in `COMMITTED` or `ABORTED`. To see the abort path, change the record's `x` in [main.cpp](main.cpp) to a negative value.
-
-Running creates `worker1_wal.dat` and `worker2_wal.dat` (100 MB each, sparse). They are generated files and should not be committed.
+The cluster integration tests were removed from `main.cpp` in commit `6d4c44a`. They cover cross-shard 2PC, replication, failover, splitting and the SDK, and are still available as `git show a20327a:main.cpp`. To run them, build that file in place of `main.cpp` and without `KittiLoader.cpp`, with ports 8081–8083 free. Two of their abort cases use `x = -1`, which is now valid, so change both to `5000.0f` first. With that change, all 18 checks pass.
 
 ## Known limitations
 
-- **Build may currently fail:** [WorkerServer.cpp](WorkerServer.cpp) calls `SpatialIndex::range_query`, but [SpatialIndex.h](SpatialIndex.h) only declares `insert`. Check that before relying on the build command above.
-- **No 2PC durability:** staged transactions live only in memory and the coordinator keeps no decision log. A worker or coordinator crash between phases leaves the outcome undefined, and there is no recovery on restart.
-- **Coordinator loop stops early:** on the first connect failure it breaks out of phase 1, so later workers are never contacted (abort is still sent to all clients, but unconnected ones just fail).
-- **WAL:** no record framing, checksum, or recovery pass. It does not wrap or grow, and `append` has no bounds check.
-- **Replication:** one connection per record, no acknowledgement, no catch-up for an offline standby, and `forward_to_standby` runs while `tx_mutex` is held in the commit path.
-- **Index:** negative coordinates are folded with `abs()`, so `(-x)` and `x` map to the same key. The index is also keyed by Z-order code alone, so two records that quantize to the same key overwrite each other.
-- **Networking:** `recv`/`send` return values are mostly unchecked, there is one blocking client at a time per worker, and the protocol is host-endian with packed structs, so it assumes the same architecture on both ends.
+- **2PC is not durable:** staged transactions live only in memory, workers log only committed data, and the coordinator keeps no decision log. A crash between phases leaves the outcome undefined.
+- **Replication:** one connection per record, with no acknowledgement and no catch-up for an offline standby.
+- **Failover:** a manual remap in the coordinator, with no failure detection.
+- **Migration:** records leave the source's index but not its WAL, so restarting the source brings migrated records back. Sends to the target are unchecked.
+- **Index:** keys come from coordinates alone, so two records in the same millimetre cell overwrite each other. The `CMD_INGEST` and `CMD_REPLICATE` paths skip range validation, so out-of-range coordinates are clamped there.
+- **Visibility:** buffered records can't be queried until the pool flushes. The demo uses a pool capacity of 1 so inserts are visible immediately.
+- **Optimizer:** it has no row statistics, so it can split a box over sparse data when the extra round trips cost more than they save.
+- **Networking:** each worker serves one connection at a time, most `send` and `recv` calls in `WorkerServer` are unchecked, and a worker can die from `SIGPIPE` if a client disappears mid-reply.
+- **WAL:** the file has a fixed size and doesn't wrap or grow.
 
 ## Possible next steps
 
-- Add a build file (CMake or Makefile) and a `.gitignore` for `*.dat` and the binary.
-- Persist 2PC state (prepared / committed / aborted) in the WAL and add a recovery pass.
-- Replace fire-and-forget replication with a persistent stream, acknowledgements, and LSN-based catch-up.
-- Add `range_query` to `SpatialIndex` and tests for the Morton encoding and shard routing.
+- Bring the cluster integration tests back and make the demo fail on an unexpected row count.
+- Add a build file (CMake or Makefile).
+- Log 2PC state (`LOG_PREPARE`, `LOG_COMMIT`, `LOG_ABORT`) so transactions survive a crash.
+- Replace per-record replication with a persistent, acknowledged stream with catch-up.
+- Make migration durable on the source.
+- Give the optimizer row statistics.

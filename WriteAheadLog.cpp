@@ -71,6 +71,14 @@ bool WriteAheadLog::append(const SpatialRecord& record) {
     return append_entry(entry);
 }
 
+bool WriteAheadLog::append_remove_range(uint64_t min_key, uint64_t max_key) {
+    LogEntry entry{};
+    entry.type = LOG_REMOVE_RANGE;
+    entry.tx_id = min_key;
+    entry.rec.timestamp = max_key;
+    return append_entry(entry);
+}
+
 size_t WriteAheadLog::size() const {
     std::lock_guard<std::mutex> lock(append_mutex);
     return header->entry_count;
