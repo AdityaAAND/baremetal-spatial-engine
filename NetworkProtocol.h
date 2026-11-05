@@ -15,8 +15,24 @@ enum CommandType : uint8_t {
     CMD_REPLICATE   = 0x0A,
     CMD_MIGRATE_RANGE = 0x0B,
     CMD_HEARTBEAT     = 0x0c,
-    CMD_SPLIT_SHARD   = 0x0d
+    CMD_SPLIT_SHARD   = 0x0d,
+    CMD_QUERY_FILTERED = 0x0e,
+    CMD_COUNT_RESP     = 0x0f,
+    CMD_GET_KEYS       = 0x10,
+    CMD_KEYS_RESP      = 0x11
 };
+
+enum FilterOp : uint8_t {
+    FILTER_EQ = 0,
+    FILTER_NE,
+    FILTER_LT,
+    FILTER_LE,
+    FILTER_GT,
+    FILTER_GE
+};
+
+// Fixed so the request stays a single packed struct, like every other payload
+constexpr uint8_t MAX_QUERY_FILTERS = 4;
 
 #pragma pack(push, 1)
 struct PacketHeader {
@@ -30,6 +46,19 @@ struct QueryRequest {
     float z_min, z_max;
 };
 
+struct QueryFilter {
+    uint8_t op;     // FilterOp, compared against SpatialRecord::metadata
+    uint32_t value;
+};
+
+struct FilteredQueryRequest {
+    QueryRequest box;
+    uint32_t limit;      // stop after this many matches; 0 means no limit
+    uint8_t count_only;  // non-zero replies CMD_COUNT_RESP (uint64_t) instead of rows
+    uint8_t filter_count;
+    QueryFilter filters[MAX_QUERY_FILTERS]; // ANDed together
+};
+
 struct TxPacket {
     uint64_t tx_id;
     SpatialRecord record;
@@ -41,6 +70,10 @@ struct MigrateRangePayload{
     uint32_t target_port;
 };
 struct SplitShardPayload{
+    uint32_t old_node;
+    uint32_t new_node;
+    uint64_t split_key;
+    
 
 };
 #pragma pack(pop)

@@ -4,8 +4,13 @@
 #include <iostream>
 #include <algorithm>
 #include <cstdio>
+#include <fstream>
+#include <limits>
 #include <map>
 #include <set>
+
+// Longer than the worker's own wait on the target, so the worker reports a stuck target first
+static constexpr int MIGRATE_TIMEOUT_SEC = 60;
 
 // Generated ids start above the small hand-picked ids callers pass to execute_2pc_transaction
 Coordinator::Coordinator() : last_tx_id(1ULL << 32) {}
@@ -175,12 +180,155 @@ bool Coordinator::execute_2pc_transaction(uint64_t tx_id, const std::vector<Spat
     }
 }
 
+std::vector<uint32_t> Coordinator::node_ids() const {
+    std::vector<uint32_t> ids;
+    for (const auto& entry : node_endpoints) ids.push_back(entry.first);
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+bool Coordinator::node_point_count(uint32_t node_id, uint64_t& count) {
+    auto endpoint = node_endpoints.find(node_id);
+    if (endpoint == node_endpoints.end()) return false;
+
+    constexpr float max = std::numeric_limits<float>::max();
+    FilteredQueryRequest req{};
+    req.box = {-max, max, -max, max, -max, max};
+    req.count_only = 1;
+
+    NetworkClient client;
+    std::vector<SpatialRecord> unused;
+    return client.connect_to_node(endpoint->second.ip.c_str(), endpoint->second.port)
+        && client.send_filtered_query(req, unused, count);
+}
+
+RebalanceResult Coordinator::rebalance(const std::string& map_path) {
+    RebalanceResult result{};
+    const std::vector<uint32_t> nodes = node_ids();
+
+    // 1. Learn where the data is. Equal key ranges would not help: points cluster in a narrow band of keys.
+    std::map<uint32_t, std::vector<uint64_t>> held;
+    std::vector<uint64_t> all_keys;
+    for (uint32_t node : nodes) {
+        const NodeEndpoint& ep = node_endpoints.at(node);
+        NetworkClient client;
+        if (!client.connect_to_node(ep.ip.c_str(), ep.port) || !client.send_get_keys(held[node])) {
+            result.error = "cannot read keys from node " + std::to_string(node);
+            return result;
+        }
+        all_keys.insert(all_keys.end(), held[node].begin(), held[node].end());
+    }
+
+    // A key on two nodes is a leftover of a failed move, and migrating it merges the copies
+    std::sort(all_keys.begin(), all_keys.end());
+    all_keys.erase(std::unique(all_keys.begin(), all_keys.end()), all_keys.end());
+    if (all_keys.size() < nodes.size()) {
+        result.error = "need at least " + std::to_string(nodes.size()) + " points to rebalance "
+                     + std::to_string(nodes.size()) + " workers";
+        return result;
+    }
+
+    // 2. Cut the sorted keys into equal groups
+    std::vector<ShardRange> new_shards;
+    uint64_t next_start = 0;
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        const bool last = i + 1 == nodes.size();
+        const uint64_t end_key = last ? MAX_MORTON_KEY : all_keys[all_keys.size() * (i + 1) / nodes.size() - 1];
+        new_shards.push_back({nodes[i], next_start, end_key});
+        next_start = end_key + 1;
+    }
+
+    // 3. Each node sends away what it no longer owns. Only one connection is open at a time, because
+    // the source connects to the target itself and a worker serves one connection at a time.
+    for (uint32_t source : nodes) {
+        const NodeEndpoint& ep = node_endpoints.at(source);
+        const std::vector<uint64_t>& keys = held[source];
+
+        for (const ShardRange& shard : new_shards) {
+            if (shard.node_id == source) continue;
+            const auto first = std::lower_bound(keys.begin(), keys.end(), shard.start_key);
+            const auto past_last = std::upper_bound(keys.begin(), keys.end(), shard.end_key);
+            if (first == past_last) continue;
+
+            const NodeEndpoint& target = node_endpoints.at(shard.node_id);
+            MigrateRangePayload payload{};
+            payload.min_key = shard.start_key;
+            payload.max_key = shard.end_key;
+            snprintf(payload.target_ip, sizeof(payload.target_ip), "%s", target.ip.c_str());
+            payload.target_port = static_cast<uint32_t>(target.port);
+
+            NetworkClient client;
+            bool moved = client.connect_to_node(ep.ip.c_str(), ep.port);
+            if (moved) {
+                client.set_receive_timeout(MIGRATE_TIMEOUT_SEC);
+                moved = client.send_migrate(payload);
+            }
+            if (!moved) {
+                result.error = "moving points from node " + std::to_string(source) + " to node "
+                             + std::to_string(shard.node_id) + " failed; queries may miss points until REBALANCE succeeds";
+                return result;
+            }
+            result.moved_points += static_cast<uint64_t>(past_last - first);
+        }
+    }
+
+    // 4. Trust the workers' counts over the plan before publishing the new map
+    uint64_t counted = 0;
+    for (uint32_t node : nodes) {
+        uint64_t count = 0;
+        if (!node_point_count(node, count)) {
+            result.error = "cannot confirm the point count on node " + std::to_string(node);
+            return result;
+        }
+        counted += count;
+    }
+    if (counted != all_keys.size()) {
+        result.error = "expected " + std::to_string(all_keys.size()) + " points after moving but found " + std::to_string(counted);
+        return result;
+    }
+
+    cluster_shards = new_shards;
+    if (!save_shard_map(map_path)) {
+        result.error = "points moved, but the shard map could not be saved to " + map_path;
+        return result;
+    }
+
+    result.ok = true;
+    result.total_points = all_keys.size();
+    return result;
+}
+
+bool Coordinator::save_shard_map(const std::string& path) const {
+    // Rename is atomic, so a crash mid-write cannot leave a half-written map behind
+    const std::string temp_path = path + ".tmp";
+    {
+        std::ofstream file(temp_path);
+        for (const auto& shard : cluster_shards) {
+            file << shard.node_id << " " << shard.start_key << " " << shard.end_key << "\n";
+        }
+        if (!file.good()) return false;
+    }
+    return std::rename(temp_path.c_str(), path.c_str()) == 0;
+}
+
+bool Coordinator::load_shard_map(const std::string& path) {
+    std::ifstream file(path);
+    if (!file.is_open()) return false;
+
+    std::vector<ShardRange> loaded;
+    ShardRange shard{};
+    while (file >> shard.node_id >> shard.start_key >> shard.end_key) loaded.push_back(shard);
+    if (!file.eof() || loaded.empty()) return false;
+
+    cluster_shards = loaded;
+    return true;
+}
+
 uint64_t Coordinator::next_tx_id() {
     return ++last_tx_id;
 }
 
-bool Coordinator::execute_query(const QueryRequest& box, std::vector<SpatialRecord>& results) {
-    // Every point in the box has a key between the corner keys, so other shards cannot hold matches
+std::set<uint32_t> Coordinator::overlapping_nodes(const QueryRequest& box) const {
     const uint64_t min_key = point_key(box.x_min, box.y_min, box.z_min);
     const uint64_t max_key = point_key(box.x_max, box.y_max, box.z_max);
 
@@ -189,8 +337,11 @@ bool Coordinator::execute_query(const QueryRequest& box, std::vector<SpatialReco
     for (const auto& shard : cluster_shards) {
         if (shard.start_key <= max_key && shard.end_key >= min_key) nodes.insert(shard.node_id);
     }
+    return nodes;
+}
 
-    for (uint32_t node_id : nodes) {
+bool Coordinator::execute_query(const QueryRequest& box, std::vector<SpatialRecord>& results) {
+    for (uint32_t node_id : overlapping_nodes(box)) {
         auto endpoint = node_endpoints.find(node_id);
         NetworkClient client;
         std::vector<SpatialRecord> matches;
@@ -202,5 +353,31 @@ bool Coordinator::execute_query(const QueryRequest& box, std::vector<SpatialReco
         }
         results.insert(results.end(), matches.begin(), matches.end());
     }
+    return true;
+}
+
+bool Coordinator::execute_filtered_query(const FilteredQueryRequest& req, std::vector<SpatialRecord>& results, uint64_t& count) {
+    uint64_t found = 0;
+    for (uint32_t node_id : overlapping_nodes(req.box)) {
+        if (req.limit != 0 && found >= req.limit) break;
+
+        // Asking each shard only for what is still missing means the rows never overshoot the limit
+        FilteredQueryRequest shard_req = req;
+        if (req.limit != 0) shard_req.limit = req.limit - static_cast<uint32_t>(found);
+
+        auto endpoint = node_endpoints.find(node_id);
+        NetworkClient client;
+        std::vector<SpatialRecord> matches;
+        uint64_t shard_count = 0;
+        if (endpoint == node_endpoints.end()
+            || !client.connect_to_node(endpoint->second.ip.c_str(), endpoint->second.port)
+            || !client.send_filtered_query(shard_req, matches, shard_count)) {
+            std::cout << "[Coordinator] Query failed: no answer from Node " << node_id << "\n";
+            return false;
+        }
+        results.insert(results.end(), matches.begin(), matches.end());
+        found += shard_count;
+    }
+    count += found;
     return true;
 }

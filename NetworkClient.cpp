@@ -36,6 +36,20 @@ static bool recv_header(int fd, PacketHeader& header) {
     return recv(fd, &header, sizeof(PacketHeader), MSG_WAITALL) == static_cast<ssize_t>(sizeof(PacketHeader));
 }
 
+static bool recv_rows(int fd, const PacketHeader& header, std::vector<SpatialRecord>& matches) {
+    const uint32_t payload_len = header.payload_len;
+    if (header.command != CMD_QUERY_RESP || payload_len % sizeof(SpatialRecord) != 0) return false;
+    if (payload_len == 0) return true;
+
+    matches.resize(payload_len / sizeof(SpatialRecord));
+    // A short read would leave zero-filled rows that look like real points at the origin
+    if (recv(fd, matches.data(), payload_len, MSG_WAITALL) != static_cast<ssize_t>(payload_len)) {
+        matches.clear();
+        return false;
+    }
+    return true;
+}
+
 NetworkClient::NetworkClient() : sock_fd(-1) {}
 
 bool NetworkClient::connect_to_node(const char* ip, int port) {
@@ -76,17 +90,24 @@ bool NetworkClient::send_query(const QueryRequest& req, std::vector<SpatialRecor
     if (!send_packet(sock_fd, CMD_QUERY, &req, sizeof(QueryRequest))) return false;
 
     PacketHeader resp_header;
-    if (!recv_header(sock_fd, resp_header)) return false;
-    const uint32_t payload_len = resp_header.payload_len;
-    if (resp_header.command != CMD_QUERY_RESP || payload_len % sizeof(SpatialRecord) != 0) return false;
-    if (payload_len == 0) return true;
+    return recv_header(sock_fd, resp_header) && recv_rows(sock_fd, resp_header, matches);
+}
 
-    matches.resize(payload_len / sizeof(SpatialRecord));
-    // A short read would leave zero-filled rows that look like real points at the origin
-    if (recv(sock_fd, matches.data(), payload_len, MSG_WAITALL) != static_cast<ssize_t>(payload_len)) {
-        matches.clear();
-        return false;
+bool NetworkClient::send_filtered_query(const FilteredQueryRequest& req, std::vector<SpatialRecord>& matches, uint64_t& count) {
+    matches.clear();
+    count = 0;
+    if (sock_fd < 0) return false;
+    if (!send_packet(sock_fd, CMD_QUERY_FILTERED, &req, sizeof(FilteredQueryRequest))) return false;
+
+    PacketHeader resp_header;
+    if (!recv_header(sock_fd, resp_header)) return false;
+
+    if (req.count_only) {
+        return resp_header.command == CMD_COUNT_RESP && resp_header.payload_len == sizeof(uint64_t)
+            && recv(sock_fd, &count, sizeof(uint64_t), MSG_WAITALL) == static_cast<ssize_t>(sizeof(uint64_t));
     }
+    if (!recv_rows(sock_fd, resp_header, matches)) return false;
+    count = matches.size();
     return true;
 }
 
@@ -114,6 +135,30 @@ bool NetworkClient::send_abort(uint64_t tx_id) {
 
     PacketHeader resp;
     return recv_header(sock_fd, resp) && resp.command == CMD_ACK;
+}
+
+bool NetworkClient::send_get_keys(std::vector<uint64_t>& keys) {
+    keys.clear();
+    if (sock_fd < 0) return false;
+    if (!send_packet(sock_fd, CMD_GET_KEYS, nullptr, 0)) return false;
+
+    PacketHeader resp;
+    if (!recv_header(sock_fd, resp)) return false;
+    const uint32_t payload_len = resp.payload_len;
+    if (resp.command != CMD_KEYS_RESP || payload_len % sizeof(uint64_t) != 0) return false;
+    if (payload_len == 0) return true;
+
+    keys.resize(payload_len / sizeof(uint64_t));
+    if (recv(sock_fd, keys.data(), payload_len, MSG_WAITALL) != static_cast<ssize_t>(payload_len)) {
+        keys.clear();
+        return false;
+    }
+    return true;
+}
+
+void NetworkClient::set_receive_timeout(int seconds) {
+    timeval tv{seconds, 0};
+    setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 }
 
 bool NetworkClient::send_migrate(const MigrateRangePayload& payload) {

@@ -11,7 +11,8 @@ enum LogType : uint8_t {
     LOG_DATA    = 0x01,
     LOG_PREPARE = 0x02,
     LOG_COMMIT  = 0x03,
-    LOG_ABORT   = 0x04
+    LOG_ABORT   = 0x04,
+    LOG_REMOVE_RANGE = 0x05 // tx_id is the first key, rec.timestamp the last
 };
 
 #pragma pack(push, 1)
@@ -41,6 +42,8 @@ public:
     WriteAheadLog(const char* filepath, size_t size_in_bytes);
     bool append(const SpatialRecord& record); // appends a LOG_DATA entry; false if the log is full
     bool append_entry(const LogEntry& entry);
+    // Keeps migrated records from reappearing here when the log is replayed
+    bool append_remove_range(uint64_t min_key, uint64_t max_key);
     size_t size() const;
     void for_each(const std::function<void(const LogEntry&)>& fn) const;
     ~WriteAheadLog();
