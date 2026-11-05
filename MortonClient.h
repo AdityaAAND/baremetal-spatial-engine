@@ -39,6 +39,10 @@ public:
     // True only once the owning shard has committed the record through 2PC
     bool insert(const SpatialRecord& record);
     bool insert(float x, float y, float z, uint64_t timestamp = 0, uint32_t metadata = 1);
+
+    // One 2PC for the whole batch: all records commit or none do. Bulk loads need this because
+    // each transaction costs a connection, and a closed connection holds its local port in TIME_WAIT.
+    bool insert_batch(const std::vector<SpatialRecord>& records);
     
     SpatialQueryBuilder query();
 };

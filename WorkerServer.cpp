@@ -1,5 +1,6 @@
 #include "WorkerServer.h"
 #include "NetworkProtocol.h"
+#include "MortonCode.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -132,7 +133,8 @@ void WorkerServer::start_listening() {
                 TxPacket tx_pkt;
                 recv(client_fd, &tx_pkt, sizeof(TxPacket), MSG_WAITALL);
 
-                if (tx_pkt.record.x < 0.0f) {
+                const SpatialRecord& rec = tx_pkt.record;
+                if (!coord_in_range(rec.x) || !coord_in_range(rec.y) || !coord_in_range(rec.z)) {
                     PacketHeader resp = {CMD_VOTE_ABORT, 0};
                     send(client_fd, &resp, sizeof(PacketHeader), 0);
                 } else {

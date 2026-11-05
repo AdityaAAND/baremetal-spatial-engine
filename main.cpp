@@ -33,6 +33,7 @@ int main(int argc, char* argv[]) {
 
     // 2. Provision Coordinator & Register Shard Range
     Coordinator coordinator;
+    coordinator.register_node(8081, {"127.0.0.1", 8081});
     coordinator.register_shard(8081, 0, std::numeric_limits<uint64_t>::max());
 
     MortonClient client(coordinator);
@@ -48,8 +49,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // 4. Run Spatial Query Over Forward Road Sector
-    // Bounding box targeting forward vehicle detection zone: X ∈ [-10, 10], Y ∈ [5, 25], Z ∈ [-2, 3]
+    // 4. Run Spatial Query Over Left-Side Sector
+    // KITTI Velodyne axes are x forward, y left, z up, so this box is left of the car: X ∈ [-10, 10], Y ∈ [5, 25], Z ∈ [-2, 3]
     std::cout << "\n--- STEP 2: Executing Bounding Box Query Over Vehicle Sector ---\n";
     QueryRequest req = {-10.0f, 10.0f, 5.0f, 25.0f, -2.0f, 3.0f};
 

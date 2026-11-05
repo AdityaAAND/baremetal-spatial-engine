@@ -11,6 +11,9 @@ constexpr uint64_t MAX_MORTON_KEY = 0x7FFFFFFFFFFFFFFFULL;
 // Order-preserving quantizer: monotone non-decreasing in v, millimeter resolution, clamped to 21 bits
 uint32_t quantize_coord(float v);
 
+// False for NaN, infinity, and values quantize_coord would clamp, which would land on the wrong key
+bool coord_in_range(float v);
+
 // Expands a 21-bit integer to 64 bits by inserting two zeros between every bit
 uint64_t expand_bits(uint32_t v);
 

@@ -48,6 +48,10 @@ bool MortonClient::insert(float x, float y, float z, uint64_t timestamp, uint32_
     return insert(rec);
 }
 
+bool MortonClient::insert_batch(const std::vector<SpatialRecord>& records) {
+    return coordinator.execute_2pc_transaction(coordinator.next_tx_id(), records);
+}
+
 SpatialQueryBuilder MortonClient::query() {
     return SpatialQueryBuilder(coordinator);
 }

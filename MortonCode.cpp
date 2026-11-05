@@ -1,11 +1,17 @@
 #include "MortonCode.h"
 
+static constexpr float MAX_QUANTIZED = 2097151.0f; // 2^21 - 1
+
 uint32_t quantize_coord(float v) {
-    const float max_val = 2097151.0f; // 2^21 - 1
     float scaled = (v + COORD_OFFSET) * 1000.0f;
     if (!(scaled > 0.0f)) return 0; // also maps NaN to 0
-    if (scaled > max_val) return 2097151u;
+    if (scaled > MAX_QUANTIZED) return 2097151u;
     return static_cast<uint32_t>(scaled);
+}
+
+bool coord_in_range(float v) {
+    float scaled = (v + COORD_OFFSET) * 1000.0f;
+    return scaled >= 0.0f && scaled <= MAX_QUANTIZED; // both comparisons are false for NaN
 }
 
 uint64_t expand_bits(uint32_t v) {

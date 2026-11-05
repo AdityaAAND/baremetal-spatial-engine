@@ -5,6 +5,9 @@
 #include <chrono>
 #include <algorithm>
 
+// Keeps a full frame (~115k points) to ~116 connections, far below the ephemeral port limit
+static constexpr size_t INSERT_BATCH_SIZE = 1000;
+
 KittiLoadResult KittiLoader::load_bin_file(MortonClient& client, const std::string& filepath) {
     KittiLoadResult result{0, 0, 0.0, 0.0, false};
 
@@ -37,6 +40,16 @@ KittiLoadResult KittiLoader::load_bin_file(MortonClient& client, const std::stri
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
+    std::vector<SpatialRecord> batch;
+    batch.reserve(INSERT_BATCH_SIZE);
+    auto flush_batch = [&]() {
+        if (batch.empty()) return;
+        if (client.insert_batch(batch)) {
+            result.points_inserted += batch.size();
+        }
+        batch.clear();
+    };
+
     for (size_t i = 0; i < buffer.size(); i += 4) {
         float x = buffer[i];
         float y = buffer[i + 1];
@@ -45,10 +58,10 @@ KittiLoadResult KittiLoader::load_bin_file(MortonClient& client, const std::stri
 
         uint32_t payload = static_cast<uint32_t>(std::clamp(reflectance * 255.0f, 0.0f, 255.0f));
 
-        if (client.insert(x, y, z, 0, payload)) {
-            result.points_inserted++;
-        }
+        batch.push_back({0, x, y, z, payload});
+        if (batch.size() == INSERT_BATCH_SIZE) flush_batch();
     }
+    flush_batch();
 
     auto end_time = std::chrono::high_resolution_clock::now();
     result.elapsed_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
