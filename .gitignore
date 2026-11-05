@@ -4,3 +4,13 @@ spatial_wal.dat
 *.o
 *.log
 CLAUDE.md
+
+# Datasets (KITTI LiDAR frames and similar); supply your own copy locally
+*.bin
+*.pcd
+*.ply
+*.las
+*.laz
+*.npy
+*.npz
+*.csv
