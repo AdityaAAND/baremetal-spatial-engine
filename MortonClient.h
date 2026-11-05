@@ -9,6 +9,7 @@
 struct QueryResult {
     bool ok;                            // false means records is empty because the query failed
     std::vector<SpatialRecord> records;
+    uint64_t count;                     // matches found; the only result of execute_count
     std::string error;
     ExecutionPlan plan;
 };
@@ -19,11 +20,21 @@ private:
     Coordinator& coordinator;
     QueryRequest req;
     bool bbox_set;
+    std::vector<QueryFilter> filters;
+    uint32_t max_rows;
+
+    QueryResult run(bool count_only);
 
 public:
     explicit SpatialQueryBuilder(Coordinator& coordinator_ref);
     SpatialQueryBuilder& bounding_box(float x_min, float x_max, float y_min, float y_max, float z_min, float z_max);
+    // The whole key space. Bounds beyond the quantizer's range also match records CMD_INGEST clamped.
+    SpatialQueryBuilder& all();
+    // Keeps records whose metadata satisfies the comparison; several calls are ANDed, up to MAX_QUERY_FILTERS
+    SpatialQueryBuilder& where(FilterOp op, uint32_t value);
+    SpatialQueryBuilder& limit(uint32_t rows); // 0 means no limit
     QueryResult execute();
+    QueryResult execute_count(); // sets count without transferring any rows
 };
 
 // Goes through the Coordinator so writes get routing and 2PC, and reads see every shard.

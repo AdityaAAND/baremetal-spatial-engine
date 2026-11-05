@@ -2,6 +2,121 @@
 
 A running log of work on this project and the reasons behind it, newest first.
 
+## 2026-11-05: Committed the session's work in layers
+
+The uncommitted work went into five commits on `fix/layer5-sdk-cluster-routing`, grouped by layer so each one builds on its own: the worker and coordinator backend, the SDK builder, the query language with line editing, `main.cpp` with `--shell` and `--shards`, and the docs. Each commit was built from a clean export of that commit.
+
+### Decisions
+
+- **Held back the `SplitShardPayload` edit.** It's unfinished and nothing uses it, so it stays as an uncommitted change in `NetworkProtocol.h`.
+- **Left out `000000.bin`.** Whether to commit it depends on the KITTI licence terms, so that call is still open.
+- **Left the push to the user.** A push can't be fully undone once others see it.
+- **Kept filtering and rebalancing in one backend commit.** They share `NetworkProtocol.h`, `WorkerServer.cpp`, `NetworkClient.cpp` and `Coordinator.cpp`, and splitting those files by hunk would have left a commit that doesn't build.
+
+## 2026-11-05: Added --shards N and REBALANCE
+
+`./spatial_db --shell --shards N` starts N workers, and `REBALANCE;` moves points so each holds an equal share. On `000000.bin` with 4 workers, the split goes from 115,310 / 74 / 0 / 0 to 28,846 each, with the same query results. These changes are uncommitted.
+
+### Decisions
+
+- **Boundaries come from the keys workers hold, not from the key range.** Halving the key range moved 0 points on this frame. The coordinator collects every key through a new `CMD_GET_KEYS`, which is about 0.9 MB for a frame.
+- **Fixed moved points coming back after a restart.** The source now logs `LOG_REMOVE_RANGE`. This was a known gap in `split_shard`, so it benefits too.
+- **Confirmed transfers with `CMD_HEARTBEAT`.** `CMD_INGEST` has no reply, so the source could never tell whether the target stored anything. A worker handles a connection in order, so an ACK to a trailing heartbeat proves everything before it was applied. This reused a command that was declared but unused.
+- **Saved boundaries to `shard_map.dat`,** written to a temp file then renamed so a crash can't leave half a file. Without it, a restart would forget them and queries would miss points.
+- **Growing is allowed and shrinking is refused.** New workers own no keys until `REBALANCE;`, so growing is safe. Dropping a worker would strand its points.
+- **The saved map sets the default worker count,** so plain `./spatial_db --shell` can't start too few workers by accident.
+- **The shell now uses `shard_<port>_wal.dat`, separate from the demo's `kitti_wal.dat`.** The demo has no shard map, so sharing a file could put points on the wrong worker. The cost is that data loaded in earlier shell sessions needs one more `LOAD`.
+- **Verify before publishing.** `rebalance` compares the workers' total with the unique key count before it replaces the map.
+- **No transaction around the whole rebalance.** A failed run leaves the old map, and running it again repairs the result. A true atomic version would be much larger.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| Fresh 4 workers: load, rebalance, rebalance again | 28,846 each, then 0 moved on the second run, with counts unchanged at every step (115,384, 20,264, 4,962, 12,055) |
+| Restart without the flag | Same 4 workers, data and boundaries. 8081 replayed 115,313 entries and restored 28,846 |
+| `--shards 2` on 4-worker data | Refused with a clear message, exit 1 |
+| Growing to 6 workers | 19,230 or 19,231 each, and it survived a restart |
+| Invalid arguments | 6 of 6 refused |
+| Fake worker dropping a transfer after 100 records | Reported as a failure, map unchanged, all points restored on the source |
+| Rerun with 60 stray copies on the target | Repaired: 57,692 each, no duplicates, box count still 20,264 |
+| Corrupt `shard_map.dat` | Rejected, map unchanged |
+| Parser table | 48 of 48 passed |
+| Line editing through a pseudo-terminal | 19 of 19 behaviours, and terminal settings restored in 4 of 4 ways of quitting |
+| Demo | 115,384 ingested, 20,264 rows |
+| TESTs 0-4 from `a20327a` with the two `5000.0f` changes | 18 of 18 passed, including `split_shard` on the new migration path |
+
+### Known limits left in place
+
+- More workers don't add speed, because the coordinator asks shards one at a time.
+- Points already moved can be missed by queries between a failed rebalance and a successful one.
+- A crash between the moves and saving the map has the same effect.
+- Standbys aren't updated by a migration.
+
+## 2026-11-05: Added line editing to the shell
+
+Arrow keys printed `^[[C` and `^[[D` at the prompt, because `std::getline` has no line editing. The earlier tests all used piped input, so they couldn't catch this. These changes are uncommitted.
+
+### Decisions
+
+- **Wrote a small `LineEditor` rather than using `readline` or `libedit`.** The project has no dependencies, and linking a library would change the build on every machine. Asking users to install `rlwrap` would only hide the problem.
+- **Added history and the usual shortcuts,** because the same key handling covers them. History is in memory only.
+- **Raw mode lasts only while a line is being typed.** Commands run on a normal terminal, and a crash during a query can't leave the terminal raw.
+- **Ctrl-C is handled as a key rather than a signal.** A signal would kill the process with the terminal still raw. It drops the current input, including a half-typed multi-line command.
+- **Long commands scroll sideways.** The usual `FIND ... WHERE ... LIMIT` is longer than 80 columns, and redrawing with `\r` only reaches the current row, so wrapped lines would leave stale text.
+- **Line editing only runs when stdin and stdout are both terminals,** so piped scripts behave as before.
+
+### Verification
+
+Run through a pseudo-terminal from scratch scripts: 19 of 19 behaviours passed, covering every listed key, unknown key sequences, a lone Esc, multi-line commands, and a long command at 40 columns. Terminal settings matched exactly after `EXIT;`, Ctrl-D, Ctrl-C and a session using arrows. Piped mode was unchanged.
+
+### Known limits left in place
+
+- Only ASCII can be typed.
+- History isn't kept between sessions.
+
+## 2026-11-05: Wrote ADR-001 for the query shell
+
+Recorded the query shell design as [ADR-001](docs/adr/ADR-001-query-shell.md), covering why it uses a keyword language, client-side parsing and worker-side filtering, and which options were rejected. `decisions.md` stays the running log, while ADRs hold the full reasoning for larger design choices, so they live in `docs/adr/`.
+
+## 2026-11-05: Added the query shell and worker-side filtering
+
+People can now type commands at `./spatial_db --shell` instead of writing C++. `WHERE`, `LIMIT` and `COUNT` run on the worker, full scans are possible but explicit, and `intensity` is an alias for `metadata`. These changes are uncommitted.
+
+### Decisions
+
+- **Keyword syntax, not MongoDB-style JSON.** It's quicker to type for coordinates and needs a much smaller parser.
+- **Every command ends with `;`.** The user asked for this. It also lets a command span several lines.
+- **Skipped real timestamps and the `(zkey, timestamp)` index key.** The user left this out for now, so `SpatialRecord`, the WAL format and the index key are unchanged.
+- **Parsing runs on the client side.** The coordinator holds the shard map and workers serve one connection at a time, so workers only needed one new command.
+- **Added `CMD_QUERY_FILTERED` and left `CMD_QUERY` in place.** Existing callers keep working. `execute()` always uses the new path, so the old SDK tests cover it too.
+- **`scan_box` takes a visitor that can stop early,** so `LIMIT` ends the scan rather than just trimming results. `range_query` wraps it, so there is one copy of the scan logic.
+- **`LIMIT` asks each shard only for what's still missing,** which makes it exact without trimming afterwards.
+- **`FIND ALL` requires `LIMIT`, and `COUNT ALL` doesn't.** A typo can't pull back the whole database, while counting returns one number.
+- **`ALL` uses `±FLT_MAX` bounds,** so it also finds records `CMD_INGEST` clamped.
+- **Logs are moved by redirecting `std::cout` to `spatial_shell.log`** instead of changing about 35 existing log lines.
+- **Added `tests/`.** It's the first subfolder, because a test `main` can't sit with the sources that the build compiles together.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| Lexer and parser table | 44 of 44 passed |
+| Scripted shell session vs counts computed separately in Python | All matched: 115,384 all, 20,264 box, 4,962 box with `intensity > 100`, 12,312 for 50-100, 70 for `>= 200`, 12,055 for `= 0`, 91,721 with only an x range |
+| `metadata` and `intensity` | Same result |
+| Two shards split at the median key (57,693 + 57,691) | Counts add up, no duplicate rows, and `LIMIT` was exact at 1, 7, 57,000, 57,692, 60,000 and 115,384 |
+| Malformed `filter_count` and `op` | Query fails and the worker keeps serving |
+| Demo regression | 115,384 ingested, 20,264 rows |
+| TESTs 0-4 from `a20327a` with the two `5000.0f` changes | 18 of 18 passed |
+
+Fixed during testing: parse errors always said `line 2`, because a newline from the previous command was carried into the next.
+
+### Known limits left in place
+
+- The shell runs its own single worker, so it can't connect to a cluster that's already running.
+- `WHERE` only compares `metadata`. It cuts network traffic but not scanning.
+- Unquoted paths get a generic error, such as `LOAD 000000.bin;` giving `unexpected 'b' after number`.
+
 ## 2026-11-05: Updated the KITTI query block in main.cpp
 
 The query block in [main.cpp](main.cpp) now uses the current SDK fields, so `main.cpp` compiles. The KITTI demo still can't build or run, because `KittiLoader.cpp` is empty and the blockers below remain. Nothing is committed.
