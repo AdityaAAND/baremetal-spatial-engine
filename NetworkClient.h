@@ -25,6 +25,8 @@ public:
     bool send_abort(uint64_t tx_id);
     bool send_migrate(const MigrateRangePayload& payload);
     bool send_get_keys(std::vector<uint64_t>& keys);
+    // The ids of transactions the worker has prepared but neither committed nor aborted
+    bool send_get_pending_tx(std::vector<uint64_t>& tx_ids);
     void set_receive_timeout(int seconds); // call after connecting; for replies slower than the default
 
     void close_connection();

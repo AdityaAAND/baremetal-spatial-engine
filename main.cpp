@@ -24,6 +24,9 @@
 static constexpr int FIRST_PORT = 8081;
 static constexpr int MAX_SHARDS = 16;
 static constexpr const char* SHARD_MAP_FILE = "shard_map.dat";
+// One per data set, like the WALs: a decision only means something to the workers it was made for
+static constexpr const char* SHELL_DECISION_FILE = "tx_decisions.dat";
+static constexpr const char* DEMO_DECISION_FILE = "kitti_tx.dat";
 
 struct Shard {
     SpatialIndex index;
@@ -152,6 +155,25 @@ int main(int argc, char* argv[]) {
         coordinator.save_shard_map(SHARD_MAP_FILE);
     }
 
+    // 3. Finish any transaction a crash interrupted, before anything can read or write
+    const char* decision_file = options.shell ? SHELL_DECISION_FILE : DEMO_DECISION_FILE;
+    if (!coordinator.open_decision_log(decision_file)) {
+        std::cerr << "error: cannot open " << decision_file << ", which is needed to commit transactions safely.\n";
+        stop_workers();
+        std::cout.rdbuf(terminal);
+        return 1;
+    }
+    const TxRecoveryResult recovery = coordinator.resolve_pending_transactions();
+    std::ostream& notices = options.shell ? shell_out : std::cout;
+    if (recovery.committed + recovery.aborted > 0) {
+        notices << "note: finished " << recovery.committed + recovery.aborted
+                << " transaction(s) interrupted by a crash: " << recovery.committed << " committed, "
+                << recovery.aborted << " aborted.\n";
+    }
+    if (!recovery.ok) {
+        notices << "warning: some interrupted transactions could not be finished; they will be retried at the next start.\n";
+    }
+
     MortonClient client(coordinator);
 
     if (options.shell) {
@@ -180,7 +202,7 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // 3. Ingest Real KITTI Point Cloud File
+    // 4. Ingest Real KITTI Point Cloud File
     std::cout << "\n--- STEP 1: Ingesting Binary LiDAR Frame (" << options.file_path << ") ---\n";
     KittiLoadResult res = KittiLoader::load_bin_file(client, options.file_path);
 
@@ -190,7 +212,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // 4. Run Spatial Query Over Left-Side Sector
+    // 5. Run Spatial Query Over Left-Side Sector
     // KITTI Velodyne axes are x forward, y left, z up, so this box is left of the car: X ∈ [-10, 10], Y ∈ [5, 25], Z ∈ [-2, 3]
     std::cout << "\n--- STEP 2: Executing Bounding Box Query Over Vehicle Sector ---\n";
     QueryRequest req = {-10.0f, 10.0f, 5.0f, 25.0f, -2.0f, 3.0f};

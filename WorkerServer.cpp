@@ -233,17 +233,25 @@ void WorkerServer::start_listening() {
                 recv(client_fd, &tx_pkt, sizeof(TxPacket), MSG_WAITALL);
 
                 const SpatialRecord& rec = tx_pkt.record;
-                if (!coord_in_range(rec.x) || !coord_in_range(rec.y) || !coord_in_range(rec.z)) {
-                    PacketHeader resp = {CMD_VOTE_ABORT, 0};
-                    send(client_fd, &resp, sizeof(PacketHeader), 0);
-                } else {
-                    {
-                        std::lock_guard<std::mutex> lock(tx_mutex);
-                        staged_tx[tx_pkt.tx_id].push_back(tx_pkt.record);
+                bool can_commit = coord_in_range(rec.x) && coord_in_range(rec.y) && coord_in_range(rec.z);
+                if (can_commit) {
+                    // A yes vote promises to commit on request, so the record is logged before the vote
+                    // is sent. A full log cannot keep that promise, so it votes no.
+                    LogEntry prepare{};
+                    prepare.type = LOG_PREPARE;
+                    prepare.tx_id = tx_pkt.tx_id;
+                    prepare.rec = rec;
+                    can_commit = wal.append_entry(prepare);
+                    if (!can_commit) {
+                        std::cerr << "[Worker Node " << port << "] WAL full: voting abort on Tx " << tx_pkt.tx_id << "\n";
                     }
-                    PacketHeader resp = {CMD_VOTE_COMMIT, 0};
-                    send(client_fd, &resp, sizeof(PacketHeader), 0);
                 }
+                if (can_commit) {
+                    std::lock_guard<std::mutex> lock(tx_mutex);
+                    staged_tx[tx_pkt.tx_id].push_back(rec);
+                }
+                PacketHeader resp = {static_cast<uint8_t>(can_commit ? CMD_VOTE_COMMIT : CMD_VOTE_ABORT), 0};
+                send(client_fd, &resp, sizeof(PacketHeader), 0);
             }
             else if (header.command == CMD_COMMIT) {
                 uint64_t tx_id;
@@ -252,8 +260,17 @@ void WorkerServer::start_listening() {
                 std::lock_guard<std::mutex> lock(tx_mutex);
                 auto it = staged_tx.find(tx_id);
                 if (it != staged_tx.end()) {
+                    // The records are already in the log as LOG_PREPARE entries, so one LOG_COMMIT
+                    // makes them all durable. Recovery applies a PREPARE only once it finds its COMMIT.
+                    LogEntry commit{};
+                    commit.type = LOG_COMMIT;
+                    commit.tx_id = tx_id;
+                    if (!wal.append_entry(commit)) {
+                        std::cerr << "[Worker Node " << port << "] WAL full: Tx " << tx_id << " is not durable\n";
+                    }
+                    wal.sync();
+
                     for (const auto& rec : it->second) {
-                        log_or_warn(rec);
                         pool.insert(rec);
                         forward_to_standby(rec);
                     }
@@ -269,7 +286,16 @@ void WorkerServer::start_listening() {
                 recv(client_fd, &tx_id, sizeof(uint64_t), MSG_WAITALL);
 
                 std::lock_guard<std::mutex> lock(tx_mutex);
-                staged_tx.erase(tx_id);
+                auto it = staged_tx.find(tx_id);
+                if (it != staged_tx.end()) {
+                    // Without this entry a restart would bring the transaction back as unfinished.
+                    // If the log is full it does come back, and the coordinator aborts it again.
+                    LogEntry abort_entry{};
+                    abort_entry.type = LOG_ABORT;
+                    abort_entry.tx_id = tx_id;
+                    wal.append_entry(abort_entry);
+                    staged_tx.erase(it);
+                }
 
                 PacketHeader resp = {CMD_ACK, 0};
                 send(client_fd, &resp, sizeof(PacketHeader), 0);
@@ -332,6 +358,17 @@ void WorkerServer::start_listening() {
                 PacketHeader resp = {CMD_KEYS_RESP, payload_len};
                 if (!send_all(client_fd, &resp, sizeof(resp))) break;
                 if (payload_len > 0 && !send_all(client_fd, keys.data(), payload_len)) break;
+            }
+            else if (header.command == CMD_GET_PENDING_TX) {
+                std::vector<uint64_t> tx_ids;
+                {
+                    std::lock_guard<std::mutex> lock(tx_mutex);
+                    for (const auto& entry : staged_tx) tx_ids.push_back(entry.first);
+                }
+                const uint32_t payload_len = static_cast<uint32_t>(tx_ids.size() * sizeof(uint64_t));
+                PacketHeader resp = {CMD_PENDING_TX_RESP, payload_len};
+                if (!send_all(client_fd, &resp, sizeof(resp))) break;
+                if (payload_len > 0 && !send_all(client_fd, tx_ids.data(), payload_len)) break;
             }
             else if (header.command == CMD_QUERY_FILTERED) {
                 FilteredQueryRequest req;

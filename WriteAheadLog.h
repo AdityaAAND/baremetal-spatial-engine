@@ -44,6 +44,8 @@ public:
     bool append_entry(const LogEntry& entry);
     // Keeps migrated records from reappearing here when the log is replayed
     bool append_remove_range(uint64_t min_key, uint64_t max_key);
+    // Forces the log to disk. Without it, entries survive a process crash but not a power loss.
+    void sync();
     size_t size() const;
     void for_each(const std::function<void(const LogEntry&)>& fn) const;
     ~WriteAheadLog();

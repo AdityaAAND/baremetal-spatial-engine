@@ -188,8 +188,11 @@ A coordinate is quantized with `(v + 1000) * 1000`, then its three 21-bit values
 
 `Coordinator::execute_2pc_transaction` groups records by owning shard and refuses the whole transaction if any record can't be routed.
 
-1. **Prepare:** the coordinator sends one `CMD_PREPARE` per record, only to the owning shards. The worker votes abort if a coordinate is NaN, infinite or outside the quantizer's range of about [-1000, 1097]. Otherwise it stages the record in memory and votes commit.
-2. **Commit or abort:** if every vote is commit, each worker writes its staged records to the WAL, inserts them into the buffer pool, and forwards them to its standby. A missing ACK is retried once on a fresh connection, which is safe because commit is idempotent. If any vote is abort, every connected worker discards the staged records, so one bad point aborts the whole batch.
+1. **Prepare:** the coordinator sends one `CMD_PREPARE` per record, only to the owning shards. The worker votes abort if a coordinate is NaN, infinite or outside the quantizer's range of about [-1000, 1097]. Otherwise it writes the record to its WAL as `LOG_PREPARE`, stages it in memory, and votes commit. A worker whose WAL is full votes abort.
+2. **Decide:** if every vote is commit, the coordinator appends the transaction id to its decision log and syncs the file. This write is the commit point. If it fails, the transaction aborts.
+3. **Commit or abort:** on commit, each worker writes one `LOG_COMMIT` entry, syncs its WAL, inserts the staged records into the buffer pool, and forwards them to its standby. A missing ACK is retried once on a fresh connection, which is safe because commit is idempotent. If any vote is abort, every connected worker writes `LOG_ABORT` and discards the staged records, so one bad point aborts the whole batch.
+
+The decision log holds commits only. A transaction that isn't in it is treated as aborted, so aborts need no write. The shell keeps its decisions in `tx_decisions.dat` and the demo in `kitti_tx.dat`; both are generated files.
 
 ### Queries
 
@@ -211,7 +214,13 @@ Halving the key range can move nothing at all on clustered data, which is why th
 
 ### Recovery
 
-On startup, a worker replays its WAL into the index. After a migration, the source logs a `LOG_REMOVE_RANGE` entry so moved records don't reappear during replay. An unrecognised WAL header reinitialises the log and discards its contents.
+On startup, a worker replays its WAL into the index. A `LOG_PREPARE` record is applied only if its `LOG_COMMIT` follows; one with neither a commit nor an abort is staged again as an unfinished transaction.
+
+Once the workers are listening, `Coordinator::resolve_pending_transactions` asks each one for its unfinished transaction ids (`CMD_GET_PENDING_TX`). It sends `CMD_COMMIT` for the ids in the decision log and `CMD_ABORT` for the rest, then empties the log. This runs before the shell prompt or the demo's ingest, so no query sees half a batch. If a worker can't be reached, the log is kept and the next start tries again.
+
+Transaction ids start from the process start time, so an id from an earlier run can't be reused while a worker still holds it.
+
+After a migration, the source logs a `LOG_REMOVE_RANGE` entry so moved records don't reappear during replay. An unrecognised WAL header reinitialises the log and discards its contents.
 
 ## Wire protocol
 
@@ -236,6 +245,8 @@ Every message is a packed `PacketHeader` (`uint8_t command`, `uint32_t payload_l
 | `CMD_COUNT_RESP` | 0x0F | worker → client | `uint64_t` match count |
 | `CMD_GET_KEYS` | 0x10 | coordinator → worker | none |
 | `CMD_KEYS_RESP` | 0x11 | worker → coordinator | array of `uint64_t` keys, in order |
+| `CMD_GET_PENDING_TX` | 0x12 | coordinator → worker | none |
+| `CMD_PENDING_TX_RESP` | 0x13 | worker → coordinator | array of `uint64_t` ids of prepared, unfinished transactions |
 
 ## Testing
 
@@ -250,9 +261,11 @@ The demo in [main.cpp](main.cpp) only exercises the single-worker KITTI path. It
 
 The cluster integration tests were removed from `main.cpp` in commit `6d4c44a`. They cover cross-shard 2PC, replication, failover, splitting and the SDK, and are still available as `git show a20327a:main.cpp`. To run them, build that file in place of `main.cpp` and without `KittiLoader.cpp`, with ports 8081–8083 free. Two of their abort cases use `x = -1`, which is now valid, so change both to `5000.0f` first. With that change, all 18 checks pass.
 
+To test crash recovery, set `SPATIAL_DB_CRASH_POINT` to `after_prepare`, `after_decision` or `after_first_commit`. The process then exits at that point of the next transaction, without flushing anything. Start the shell again and check the counts: a crash at `after_prepare` must leave none of the batch, and the other two must leave all of it on every shard. `SHOW SHARDS;` gives the count per worker.
+
 ## Known limitations
 
-- **2PC is not durable:** staged transactions live only in memory, workers log only committed data, and the coordinator keeps no decision log. A crash between phases leaves the outcome undefined.
+- **2PC recovery:** an interrupted transaction is finished only when the process restarts, and its records stay staged until then. Workers sync their WAL at commit but not at prepare, so a power loss during Phase 1 can lose a prepared record; a process crash cannot. If a worker's WAL fills between its vote and the commit, that commit is applied but not durable. Deleting a decision file while keeping the WALs turns any unfinished commit into an abort.
 - **Replication:** one connection per record, with no acknowledgement and no catch-up for an offline standby.
 - **Failover:** a manual remap in the coordinator, with no failure detection.
 - **Migration and rebalancing:** records move one worker at a time with no transaction around the whole operation. If a transfer fails, the shard map stays as it was, but points already moved can be missed by queries until `REBALANCE;` succeeds. A crash mid-rebalance can leave the same risk, and a target that took part of a failed transfer keeps those copies until the next `REBALANCE;`. Standbys aren't updated by a move. `SHOW SHARDS;` and `REBALANCE;` assume no other client is writing.
@@ -268,7 +281,6 @@ The cluster integration tests were removed from `main.cpp` in commit `6d4c44a`. 
 
 - Bring the cluster integration tests back and make the demo fail on an unexpected row count.
 - Add a build file (CMake or Makefile).
-- Log 2PC state (`LOG_PREPARE`, `LOG_COMMIT`, `LOG_ABORT`) so transactions survive a crash.
 - Replace per-record replication with a persistent, acknowledged stream with catch-up.
 - Ask shards in parallel, so more workers mean faster queries.
 - Make rebalancing atomic, so a failed one can't affect queries.

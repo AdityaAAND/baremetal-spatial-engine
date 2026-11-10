@@ -137,23 +137,32 @@ bool NetworkClient::send_abort(uint64_t tx_id) {
     return recv_header(sock_fd, resp) && resp.command == CMD_ACK;
 }
 
-bool NetworkClient::send_get_keys(std::vector<uint64_t>& keys) {
-    keys.clear();
-    if (sock_fd < 0) return false;
-    if (!send_packet(sock_fd, CMD_GET_KEYS, nullptr, 0)) return false;
+// Sends an empty request and reads back an array of uint64_t, which is the shape of both list replies
+static bool request_u64_list(int fd, uint8_t request, uint8_t expected_reply, std::vector<uint64_t>& values) {
+    values.clear();
+    if (fd < 0) return false;
+    if (!send_packet(fd, request, nullptr, 0)) return false;
 
     PacketHeader resp;
-    if (!recv_header(sock_fd, resp)) return false;
+    if (!recv_header(fd, resp)) return false;
     const uint32_t payload_len = resp.payload_len;
-    if (resp.command != CMD_KEYS_RESP || payload_len % sizeof(uint64_t) != 0) return false;
+    if (resp.command != expected_reply || payload_len % sizeof(uint64_t) != 0) return false;
     if (payload_len == 0) return true;
 
-    keys.resize(payload_len / sizeof(uint64_t));
-    if (recv(sock_fd, keys.data(), payload_len, MSG_WAITALL) != static_cast<ssize_t>(payload_len)) {
-        keys.clear();
+    values.resize(payload_len / sizeof(uint64_t));
+    if (recv(fd, values.data(), payload_len, MSG_WAITALL) != static_cast<ssize_t>(payload_len)) {
+        values.clear();
         return false;
     }
     return true;
+}
+
+bool NetworkClient::send_get_keys(std::vector<uint64_t>& keys) {
+    return request_u64_list(sock_fd, CMD_GET_KEYS, CMD_KEYS_RESP, keys);
+}
+
+bool NetworkClient::send_get_pending_tx(std::vector<uint64_t>& tx_ids) {
+    return request_u64_list(sock_fd, CMD_GET_PENDING_TX, CMD_PENDING_TX_RESP, tx_ids);
 }
 
 void NetworkClient::set_receive_timeout(int seconds) {
