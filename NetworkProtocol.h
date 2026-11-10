@@ -19,7 +19,9 @@ enum CommandType : uint8_t {
     CMD_QUERY_FILTERED = 0x0e,
     CMD_COUNT_RESP     = 0x0f,
     CMD_GET_KEYS       = 0x10,
-    CMD_KEYS_RESP      = 0x11
+    CMD_KEYS_RESP      = 0x11,
+    CMD_GET_PENDING_TX  = 0x12,
+    CMD_PENDING_TX_RESP = 0x13
 };
 
 enum FilterOp : uint8_t {

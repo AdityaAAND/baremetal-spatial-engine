@@ -13,6 +13,13 @@ struct NodeEndpoint{
     int port;
 };
 
+// What resolve_pending_transactions did with the transactions a crash left unfinished
+struct TxRecoveryResult {
+    bool ok;            // false if a worker could not be asked or did not confirm
+    uint64_t committed; // distinct transactions
+    uint64_t aborted;
+};
+
 struct RebalanceResult {
     bool ok;
     std::string error;
@@ -25,12 +32,28 @@ private:
     std::vector<ShardRange> cluster_shards;
     std::unordered_map<uint32_t, NodeEndpoint> node_endpoints; // node_id -> network address
     uint64_t last_tx_id;
+    int decision_fd; // -1 when no decision log is open; commits are then not recoverable
+
+    // Records that tx_id commits. Must reach the disk before any worker is told to commit.
+    bool log_commit_decision(uint64_t tx_id);
+    std::set<uint64_t> logged_commit_decisions() const;
 
     // Every point in the box has a key between the corner keys, so other shards cannot hold matches
     std::set<uint32_t> overlapping_nodes(const QueryRequest& box) const;
 
 public:
     Coordinator();
+    ~Coordinator();
+    // Owns the decision log's file descriptor
+    Coordinator(const Coordinator&) = delete;
+    Coordinator& operator=(const Coordinator&) = delete;
+
+    // The file that remembers commit decisions across a crash. Without one, 2PC still works but an
+    // interrupted transaction cannot be finished after a restart.
+    bool open_decision_log(const std::string& path);
+    // Finishes transactions a crash interrupted: asks each worker what it still has prepared, commits
+    // those in the decision log and aborts the rest. Call once the workers listen, before new work.
+    TxRecoveryResult resolve_pending_transactions();
     void register_node(uint32_t node_id, const NodeEndpoint& endpoint);
     void register_shard(uint32_t node_id, uint64_t start_key, uint64_t end_key);
     uint32_t route_query(float x, float y, float z);

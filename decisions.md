@@ -2,6 +2,49 @@
 
 A running log of work on this project and the reasons behind it, newest first.
 
+## 2026-11-10: Made 2PC survive a crash
+
+A transaction interrupted by a crash is now finished at the next start: committed on every shard if the coordinator had decided to commit, and aborted on every shard otherwise. Before this, staged records lived only in memory and the decision was written nowhere, so a crash between the phases could leave one shard with its part of a batch and another without. The work is uncommitted, on a new branch `feat/2pc-durability`.
+
+### Decisions
+
+- **Worker logs `LOG_PREPARE` before it votes yes.** A yes vote promises to commit later, and a promise held only in memory is lost in a crash. A full WAL now votes no.
+- **One `LOG_COMMIT` per transaction replaces the per-record `LOG_DATA`.** The records are already in the log from the prepare, so writing them again would double WAL use. A frame load is 115,500 entries, against 115,384 before.
+- **Worker logs `LOG_ABORT`,** so an aborted transaction doesn't come back as unfinished after a restart.
+- **Coordinator writes a decision log before Phase 2.** That write is the commit point: a crash before it means abort, and a crash after it means commit.
+- **Presumed abort.** Only commits are logged. A transaction missing from the log never passed Phase 1, so abort is the right answer and costs no write.
+- **Startup resolves unfinished transactions.** The worker knows which are unfinished and the coordinator knows how they ended, so a new `CMD_GET_PENDING_TX` lets the coordinator ask and then send COMMIT or ABORT. It runs before any new work.
+- **The decision log is emptied after a clean resolve,** which keeps it small without an end record per transaction. It is kept if any worker failed to answer.
+- **Transaction ids start from the start time.** Ids now outlive the process in the WAL, and a reused id would add old staged records to a new transaction.
+- **WAL sync at commit, not at prepare.** A sync per prepared record would be 115,384 syncs per frame. Load time stayed at about 3.2 s.
+- **`SPATIAL_DB_CRASH_POINT` test switch.** The windows between phases are too short to hit by hand.
+- **Branched from `fix/layer5-sdk-cluster-routing`, not `main`.** `main` doesn't build: it is missing commit `2e489e1`, which adds the `SpatialQueryBuilder` declarations to `MortonClient.h`. That branch also has the newer README.
+
+### Verification
+
+All run in a scratch directory, so the repo's data files were not touched.
+
+| Check | Result |
+|---|---|
+| Build with `-Wall` | No warnings |
+| Shell, 1 worker: `LOAD`, `COUNT ALL;`, filtered count | 115,384 and 4,962, and the same after a restart |
+| Demo | 115,384 / 115,384 ingested, 20,264 rows |
+| Crash at `after_prepare`, 2 shards, 1,000-point batch | After restart: 1 aborted, 0 and 0 points |
+| Crash at `after_decision` | After restart: 1 committed, 107 and 893 points |
+| Crash at `after_first_commit` | After restart: 1 committed, 107 and 893 points |
+| Second restart after each crash | Same counts, nothing left to resolve, decision log empty |
+| Cluster tests from `a20327a` | 18 of 18 pass |
+| `tests/query_test.cpp` | 48 of 48 pass |
+
+The no-crash baseline for the 1,000-point batch is 107 points on 8081 and 893 on 8082.
+
+### Known limits left in place
+
+- An unfinished transaction waits for a restart, as in plain 2PC.
+- A power loss during Phase 1 can lose a prepared record. A process crash cannot.
+- A WAL that fills between the vote and the commit leaves that commit applied but not durable.
+- A transaction prepared before a `REBALANCE;` and resolved after it can land on a worker that no longer owns the key. This was not tested.
+
 ## 2026-11-05: Committed the session's work in layers
 
 The uncommitted work went into five commits on `fix/layer5-sdk-cluster-routing`, grouped by layer so each one builds on its own: the worker and coordinator backend, the SDK builder, the query language with line editing, `main.cpp` with `--shell` and `--shards`, and the docs. Each commit was built from a clean export of that commit.

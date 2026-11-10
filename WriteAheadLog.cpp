@@ -79,6 +79,10 @@ bool WriteAheadLog::append_remove_range(uint64_t min_key, uint64_t max_key) {
     return append_entry(entry);
 }
 
+void WriteAheadLog::sync() {
+    msync(mapped_memory, file_size, MS_SYNC);
+}
+
 size_t WriteAheadLog::size() const {
     std::lock_guard<std::mutex> lock(append_mutex);
     return header->entry_count;

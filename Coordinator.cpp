@@ -4,16 +4,107 @@
 #include <iostream>
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <fcntl.h>
 #include <fstream>
 #include <limits>
 #include <map>
 #include <set>
+#include <sys/stat.h>
+#include <unistd.h>
 
 // Longer than the worker's own wait on the target, so the worker reports a stuck target first
 static constexpr int MIGRATE_TIMEOUT_SEC = 60;
 
-// Generated ids start above the small hand-picked ids callers pass to execute_2pc_transaction
-Coordinator::Coordinator() : last_tx_id(1ULL << 32) {}
+// Test switch: SPATIAL_DB_CRASH_POINT=<name> kills the process at that point of a 2PC transaction.
+// The windows between the phases are too short to hit by killing the process by hand.
+static void crash_if_requested(const char* point) {
+    const char* requested = std::getenv("SPATIAL_DB_CRASH_POINT");
+    if (requested != nullptr && std::strcmp(requested, point) == 0) {
+        std::cerr << "[Coordinator] SPATIAL_DB_CRASH_POINT=" << point << ": exiting\n";
+        _exit(1); // no destructors or flushes, like a real crash
+    }
+}
+
+// Workers keep transaction ids in their logs, so an id must not come back in a later run: a reused
+// id would add its records to whatever an old unfinished transaction left staged. The start time
+// in the top half keeps runs apart, and stays above the small hand-picked ids callers pass in.
+Coordinator::Coordinator()
+    : last_tx_id(static_cast<uint64_t>(std::time(nullptr)) << 32), decision_fd(-1) {}
+
+Coordinator::~Coordinator() {
+    if (decision_fd >= 0) close(decision_fd);
+}
+
+bool Coordinator::open_decision_log(const std::string& path) {
+    if (decision_fd >= 0) close(decision_fd);
+    decision_fd = open(path.c_str(), O_RDWR | O_CREAT | O_APPEND, 0666);
+    return decision_fd >= 0;
+}
+
+bool Coordinator::log_commit_decision(uint64_t tx_id) {
+    return write(decision_fd, &tx_id, sizeof(tx_id)) == static_cast<ssize_t>(sizeof(tx_id))
+        && fsync(decision_fd) == 0;
+}
+
+std::set<uint64_t> Coordinator::logged_commit_decisions() const {
+    std::set<uint64_t> decisions;
+    struct stat st{};
+    if (decision_fd < 0 || fstat(decision_fd, &st) != 0) return decisions;
+
+    // Whole ids only: a torn last write never reached fsync, so no worker was told to commit it
+    const size_t count = static_cast<size_t>(st.st_size) / sizeof(uint64_t);
+    std::vector<uint64_t> ids(count);
+    const ssize_t wanted = static_cast<ssize_t>(count * sizeof(uint64_t));
+    if (count > 0 && pread(decision_fd, ids.data(), static_cast<size_t>(wanted), 0) == wanted) {
+        decisions.insert(ids.begin(), ids.end());
+    }
+    return decisions;
+}
+
+TxRecoveryResult Coordinator::resolve_pending_transactions() {
+    TxRecoveryResult result{true, 0, 0};
+    if (decision_fd < 0) return result;
+
+    // Presumed abort: only commits are logged, so a transaction missing from the log never got
+    // past Phase 1 and no worker can have committed it.
+    const std::set<uint64_t> decided_commit = logged_commit_decisions();
+    std::set<uint64_t> committed, aborted;
+
+    for (uint32_t node_id : node_ids()) {
+        const NodeEndpoint& ep = node_endpoints.at(node_id);
+        NetworkClient client;
+        std::vector<uint64_t> pending;
+        if (!client.connect_to_node(ep.ip.c_str(), ep.port) || !client.send_get_pending_tx(pending)) {
+            std::cout << "[Coordinator] Recovery: cannot ask Node " << node_id << " for unfinished transactions\n";
+            result.ok = false;
+            continue;
+        }
+
+        for (uint64_t tx_id : pending) {
+            const bool commit = decided_commit.count(tx_id) != 0;
+            const bool acked = commit ? client.send_commit(tx_id) : client.send_abort(tx_id);
+            if (!acked) {
+                std::cout << "[Coordinator] Recovery: Node " << node_id << " did not confirm TxID=" << tx_id << "\n";
+                result.ok = false;
+                break; // the connection is no longer usable
+            }
+            (commit ? committed : aborted).insert(tx_id);
+            std::cout << "[Coordinator] Recovery: TxID=" << tx_id << (commit ? " COMMITTED" : " ABORTED")
+                      << " on Node " << node_id << "\n";
+        }
+    }
+
+    result.committed = committed.size();
+    result.aborted = aborted.size();
+
+    // Every worker has finished every logged transaction, so the decisions are no longer needed.
+    // After a failure they are kept, so the next start can try again.
+    if (result.ok && (ftruncate(decision_fd, 0) != 0 || fsync(decision_fd) != 0)) result.ok = false;
+    return result;
+}
 
 void Coordinator::register_node(uint32_t node_id, const NodeEndpoint& endpoint) {
     node_endpoints[node_id] = endpoint;
@@ -144,6 +235,17 @@ bool Coordinator::execute_2pc_transaction(uint64_t tx_id, const std::vector<Spat
         }
     }
 
+    if (all_voted_commit) crash_if_requested("after_prepare");
+
+    // The transaction commits at this write, not at the first CMD_COMMIT: once the decision is on
+    // disk, a restart finishes the commit on every worker. If it cannot be written, abort instead,
+    // because a crash would then leave workers with no way to learn the outcome.
+    if (all_voted_commit && decision_fd >= 0 && !log_commit_decision(tx_id)) {
+        std::cout << "[Coordinator] TxID=" << tx_id << ": cannot write the commit decision, aborting\n";
+        all_voted_commit = false;
+    }
+    if (all_voted_commit) crash_if_requested("after_decision");
+
     // --- PHASE 2: COMMIT OR ABORT ---
     if (all_voted_commit) {
         // The COMMIT decision is final. A missing ACK leaves that node's outcome unknown, so retry once
@@ -163,6 +265,7 @@ bool Coordinator::execute_2pc_transaction(uint64_t tx_id, const std::vector<Spat
                 std::cout << "[Coordinator] WARNING: Node " << nodes[i]
                           << " did not ACK COMMIT for TxID=" << tx_id << " (outcome on that node unknown)\n";
             }
+            if (i == 0) crash_if_requested("after_first_commit");
         }
         if (!all_acked) {
             std::cout << "[Coordinator] TxID=" << tx_id << " decided COMMIT, but not all participants confirmed it\n";
