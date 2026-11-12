@@ -49,8 +49,9 @@ struct QueryRequest {
 };
 
 struct QueryFilter {
-    uint8_t op;     // FilterOp, compared against SpatialRecord::metadata
-    uint32_t value;
+    uint8_t op;     // FilterOp, compared against (SpatialRecord::metadata & mask)
+    uint32_t value; // already shifted into the mask's bits
+    uint32_t mask;  // which bits of metadata take part: all, the dataset id, or the intensity
 };
 
 struct FilteredQueryRequest {

@@ -30,8 +30,9 @@ public:
     SpatialQueryBuilder& bounding_box(float x_min, float x_max, float y_min, float y_max, float z_min, float z_max);
     // The whole key space. Bounds beyond the quantizer's range also match records CMD_INGEST clamped.
     SpatialQueryBuilder& all();
-    // Keeps records whose metadata satisfies the comparison; several calls are ANDed, up to MAX_QUERY_FILTERS
-    SpatialQueryBuilder& where(FilterOp op, uint32_t value);
+    // Keeps records whose (metadata & mask) satisfies the comparison; several calls are ANDed, up to
+    // MAX_QUERY_FILTERS. value must already sit in the mask's bits, e.g. dataset_id << 16 for DATASET_MASK.
+    SpatialQueryBuilder& where(FilterOp op, uint32_t value, uint32_t mask = 0xFFFFFFFFu);
     SpatialQueryBuilder& limit(uint32_t rows); // 0 means no limit
     QueryResult execute();
     QueryResult execute_count(); // sets count without transferring any rows

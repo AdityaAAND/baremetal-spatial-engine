@@ -4,6 +4,7 @@
 #include "QueryParser.h"
 #include <istream>
 #include <ostream>
+#include <shared_mutex>
 #include <string>
 
 class QueryExecutor {
@@ -12,6 +13,7 @@ private:
     Coordinator& coordinator;
     std::ostream& out;
     std::string shard_map_path;
+    std::shared_mutex& cluster_lock; // taken exclusively by REBALANCE; the HTTP thread reads under it
 
     SpatialQueryBuilder build_query(const Command& command);
     void run_find(const Command& command);
@@ -24,7 +26,8 @@ private:
     void run_help();
 
 public:
-    QueryExecutor(MortonClient& client_ref, Coordinator& coordinator_ref, std::ostream& output, const std::string& map_path);
+    QueryExecutor(MortonClient& client_ref, Coordinator& coordinator_ref, std::ostream& output, const std::string& map_path,
+                  std::shared_mutex& lock);
 
     // False means the session should end
     bool run(const Command& command);

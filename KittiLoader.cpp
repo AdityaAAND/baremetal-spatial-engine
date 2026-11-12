@@ -8,7 +8,7 @@
 // Keeps a full frame (~115k points) to ~116 connections, far below the ephemeral port limit
 static constexpr size_t INSERT_BATCH_SIZE = 1000;
 
-KittiLoadResult KittiLoader::load_bin_file(MortonClient& client, const std::string& filepath) {
+KittiLoadResult KittiLoader::load_bin_file(MortonClient& client, const std::string& filepath, uint32_t dataset_id) {
     KittiLoadResult result{0, 0, 0.0, 0.0, false};
 
     std::ifstream input(filepath, std::ios::binary | std::ios::ate);
@@ -56,7 +56,8 @@ KittiLoadResult KittiLoader::load_bin_file(MortonClient& client, const std::stri
         float z = buffer[i + 2];
         float reflectance = buffer[i + 3];
 
-        uint32_t payload = static_cast<uint32_t>(std::clamp(reflectance * 255.0f, 0.0f, 255.0f));
+        const uint32_t intensity = static_cast<uint32_t>(std::clamp(reflectance * 255.0f, 0.0f, 255.0f));
+        const uint32_t payload = pack_payload(dataset_id, intensity);
 
         batch.push_back({0, x, y, z, payload});
         if (batch.size() == INSERT_BATCH_SIZE) flush_batch();
