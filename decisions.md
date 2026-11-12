@@ -52,6 +52,10 @@ One fault was found and fixed during this: a request just over the 8 KB cap was 
 - I tested the page only in headless Chrome with software rendering; mouse orbiting and the sliders were not exercised by hand.
 - The demo (`./spatial_db` without `--shell`) now prints packed payloads such as 65620 in its sample rows.
 
+### Follow-up: removed `docs/adr/`
+
+Deleted `docs/adr/ADR-001-query-shell.md`, the folder's only file, from `main` at your request, and dropped the link to it from the 2026-11-05 entry below. The file is still in earlier commits and on the two feature branches.
+
 ## 2026-11-10: Made 2PC survive a crash
 
 A transaction interrupted by a crash is now finished at the next start: committed on every shard if the coordinator had decided to commit, and aborted on every shard otherwise. Before this, staged records lived only in memory and the decision was written nowhere, so a crash between the phases could leave one shard with its part of a batch and another without. The work is uncommitted, on a new branch `feat/2pc-durability`.
@@ -170,7 +174,7 @@ Run through a pseudo-terminal from scratch scripts: 19 of 19 behaviours passed, 
 
 ## 2026-11-05: Wrote ADR-001 for the query shell
 
-Recorded the query shell design as [ADR-001](docs/adr/ADR-001-query-shell.md), covering why it uses a keyword language, client-side parsing and worker-side filtering, and which options were rejected. `decisions.md` stays the running log, while ADRs hold the full reasoning for larger design choices, so they live in `docs/adr/`.
+Recorded the query shell design as ADR-001, covering why it uses a keyword language, client-side parsing and worker-side filtering, and which options were rejected. The file was removed from the repository on 2026-11-12, so `decisions.md` is now the only record.
 
 ## 2026-11-05: Added the query shell and worker-side filtering
 
