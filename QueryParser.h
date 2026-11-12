@@ -31,6 +31,7 @@ struct Command {
 
     // LOAD
     std::string path;
+    uint32_t dataset_id;             // 1 to MAX_DATASET_ID; 0 is kept for points that INSERT adds
 };
 
 struct ParseResult {

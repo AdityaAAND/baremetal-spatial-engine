@@ -16,8 +16,8 @@ SpatialQueryBuilder& SpatialQueryBuilder::all() {
     return bounding_box(-max, max, -max, max, -max, max);
 }
 
-SpatialQueryBuilder& SpatialQueryBuilder::where(FilterOp op, uint32_t value) {
-    filters.push_back({static_cast<uint8_t>(op), value});
+SpatialQueryBuilder& SpatialQueryBuilder::where(FilterOp op, uint32_t value, uint32_t mask) {
+    filters.push_back({static_cast<uint8_t>(op), value, mask});
     return *this;
 }
 

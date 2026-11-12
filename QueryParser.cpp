@@ -130,17 +130,26 @@ private:
     }
 
     void parse_condition(Command& command) {
-        // intensity is the same field: KittiLoader stores reflectance in metadata
-        if (!at_word("METADATA") && !at_word("INTENSITY")) expected("metadata or intensity");
+        // Three views of one field: metadata is all 32 bits, dataset the high 16, intensity the low 16.
+        // The worker masks before comparing, so intensity means the same thing in every dataset.
+        const bool whole = at_word("METADATA");
+        const bool dataset = at_word("DATASET");
+        if (!whole && !dataset && !at_word("INTENSITY")) expected("metadata, intensity or dataset");
         const Token field = current();
         advance();
 
         const FilterOp op = parse_op();
-        const uint32_t value = parse_uint("the comparison");
+        const Token number = current();
+        uint32_t value = parse_uint("the comparison");
+        // A larger value can never match the 16-bit field, and shifting a dataset id would wrap it
+        if (!whole && value > MAX_DATASET_ID) fail(number, upper(field.text) + " values go from 0 to 65535");
+        if (dataset) value <<= 16;
+
         if (command.filters.size() >= MAX_QUERY_FILTERS) {
             fail(field, "a query can have at most " + std::to_string(MAX_QUERY_FILTERS) + " conditions");
         }
-        command.filters.push_back({static_cast<uint8_t>(op), value});
+        const uint32_t mask = whole ? 0xFFFFFFFFu : dataset ? DATASET_MASK : INTENSITY_MASK;
+        command.filters.push_back({static_cast<uint8_t>(op), value, mask});
     }
 
     void parse_where(Command& command) {
@@ -186,7 +195,10 @@ private:
         expect_symbol(")");
         if (at_word("METADATA") || at_word("INTENSITY")) {
             advance();
+            const Token value = current();
             command.metadata = parse_uint("metadata");
+            // The high 16 bits are the dataset id, and only LOAD may set one
+            if (command.metadata > INTENSITY_MASK) fail(value, "METADATA for INSERT goes from 0 to 65535");
         }
     }
 
@@ -212,6 +224,15 @@ private:
             if (current().type != TokenType::STRING) expected("a quoted file path");
             command.path = current().text;
             advance();
+            if (at_word("AS")) {
+                advance();
+                expect_word("DATASET");
+                const Token value = current();
+                command.dataset_id = parse_uint("the dataset id");
+                if (command.dataset_id == 0 || command.dataset_id > MAX_DATASET_ID) {
+                    fail(value, "the dataset id goes from 1 to 65535");
+                }
+            }
         } else if (at_word("SHOW")) {
             command.kind = CommandKind::SHOW_SHARDS;
             advance();
@@ -236,6 +257,7 @@ public:
     Command run() {
         Command command{};
         command.metadata = 1;
+        command.dataset_id = 1;
         parse_body(command);
         expect_symbol(";");
         if (current().type != TokenType::END) expected("end of command");

@@ -9,12 +9,14 @@
 #include "KittiLoader.h"
 #include "QueryExecutor.h"
 #include "MortonCode.h"
+#include "VisualizerServer.h"
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <shared_mutex>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -23,6 +25,7 @@
 
 static constexpr int FIRST_PORT = 8081;
 static constexpr int MAX_SHARDS = 16;
+static constexpr int DEFAULT_HTTP_PORT = 8080; // just below the workers
 static constexpr const char* SHARD_MAP_FILE = "shard_map.dat";
 // One per data set, like the WALs: a decision only means something to the workers it was made for
 static constexpr const char* SHELL_DECISION_FILE = "tx_decisions.dat";
@@ -41,6 +44,7 @@ struct Shard {
 struct Options {
     bool shell = false;
     int shards = 0; // 0 means not given
+    int http_port = 0; // 0 means no viewer
     std::string file_path = "000000.bin";
 };
 
@@ -60,6 +64,15 @@ static bool parse_args(int argc, char* argv[], Options& options) {
             const long count = std::strtol(argv[i], &end, 10);
             if (*end != '\0' || count < 1 || count > MAX_SHARDS) return false;
             options.shards = static_cast<int>(count);
+        } else if (arg == "--http") {
+            options.http_port = DEFAULT_HTTP_PORT;
+            // The port is optional, so only take the next argument if it is a number
+            if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9') {
+                char* end = nullptr;
+                const long port = std::strtol(argv[++i], &end, 10);
+                if (*end != '\0' || port < 1024 || port > 65535) return false;
+                options.http_port = static_cast<int>(port);
+            }
         } else if (arg.rfind("--", 0) == 0 || path_given) {
             return false;
         } else {
@@ -67,6 +80,7 @@ static bool parse_args(int argc, char* argv[], Options& options) {
             path_given = true;
         }
     }
+    if (options.http_port != 0 && !options.shell) return false;
     return !(options.shards != 0 && !options.shell) && !(options.shell && path_given);
 }
 
@@ -93,7 +107,9 @@ int main(int argc, char* argv[]) {
     Options options;
     if (!parse_args(argc, argv, options)) {
         std::cerr << "usage: spatial_db [frame.bin]\n"
-                  << "       spatial_db --shell [--shards N]   (N from 1 to " << MAX_SHARDS << ")\n";
+                  << "       spatial_db --shell [--shards N] [--http [PORT]]\n"
+                  << "         N from 1 to " << MAX_SHARDS << "; --http serves the 3D viewer, on port "
+                  << DEFAULT_HTTP_PORT << " unless PORT (1024-65535) is given\n";
         return 1;
     }
 
@@ -111,6 +127,12 @@ int main(int argc, char* argv[]) {
 
     int worker_count = 1;
     if (options.shell) worker_count = options.shards != 0 ? options.shards : std::max(saved_workers, 1);
+
+    if (options.http_port >= FIRST_PORT && options.http_port < FIRST_PORT + worker_count) {
+        std::cerr << "error: port " << options.http_port << " is used by a worker; workers take "
+                  << FIRST_PORT << " to " << FIRST_PORT + worker_count - 1 << ".\n";
+        return 1;
+    }
 
     // Every component logs to std::cout, which would bury query results. Moving std::cout to a
     // file before the workers start keeps the terminal for results only.
@@ -194,9 +216,22 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        QueryExecutor executor(client, coordinator, shell_out, SHARD_MAP_FILE);
+        std::shared_mutex cluster_lock;
+        VisualizerServer visualizer(coordinator, client, cluster_lock, options.http_port);
+        if (options.http_port != 0) {
+            if (!visualizer.start()) {
+                std::cerr << "error: cannot listen on port " << options.http_port << " for the viewer; try --http with another port.\n";
+                stop_workers();
+                std::cout.rdbuf(terminal);
+                return 1;
+            }
+            shell_out << "3D viewer at http://127.0.0.1:" << options.http_port << "/ (shows points added by LOAD).\n";
+        }
+
+        QueryExecutor executor(client, coordinator, shell_out, SHARD_MAP_FILE, cluster_lock);
         run_shell(executor, std::cin, shell_out, isatty(STDIN_FILENO) != 0 && isatty(STDOUT_FILENO) != 0);
 
+        visualizer.stop(); // before the workers, so a request in progress still gets its answer
         stop_workers();
         std::cout.rdbuf(terminal); // shell_log is about to close
         return 0;

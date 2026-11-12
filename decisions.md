@@ -2,6 +2,56 @@
 
 A running log of work on this project and the reasons behind it, newest first.
 
+## 2026-11-12: Added dataset-tagged payloads and a live three.js viewer
+
+`./spatial_db --shell --http` now serves a 3D view of the points a `LOAD` ingested, read back from the workers as JSON. Points carry `payload = (dataset_id << 16) | (intensity & 0xFFFF)` in the existing `metadata` field. The work is uncommitted, on `feat/2pc-durability`.
+
+### Decisions
+
+- **The payload equation was adopted as written.** It fits the existing `uint32 metadata`, so the record, WAL and wire record are unchanged. The dataset id is in the high bits so that one dataset is a contiguous range of values.
+- **Filters gained a mask, applied on the worker.** Without it `WHERE intensity > 100` compares the whole packed value, and every point in dataset 1 or above passes. `intensity`, `dataset` and `metadata` are now three masks over one field. The alternative, rewriting filters in the parser, cannot express "intensity across all datasets".
+- **`LOAD` tags points with dataset 1 or more; `INSERT` stores dataset 0.** You asked for the viewer to show only what `LOAD` ingested. The tag is what lets the worker tell the two apart, so `INSERT ... METADATA` is now limited to 0-65,535.
+- **HTTP JSON bridge inside `spatial_db`, as you chose,** rather than an export file. The page stays live: it polls a count every 2 s and refetches when it changes.
+- **Two flat JSON arrays, not one array per point.** They copy straight into typed arrays. A frame is about 3 MB.
+- **Key spans travel as strings.** They reach 2^63, and a JavaScript number is exact only to 2^53.
+- **A shared mutex between the HTTP thread and `REBALANCE;`.** `rebalance` replaces the shard map and moves points while it runs, and the `Coordinator` has no locking of its own. Other shell commands only read the map, so they take no lock.
+- **The server polls for stop and is joined at exit.** A detached thread, as the workers use, could still be inside the `Coordinator` while `main` destroys it.
+- **Loopback only, `GET` only.** The server has no authentication.
+- **Z-order colour uses key rank, not `mkey >> 40`.** That shift keeps 23 bits, a cell of 16.4 m, and a KITTI frame spans about 10 cells per axis, so nearly every point would get the same colour. The server sorts rows by `point_key` and the page colours by array position, which costs no extra JSON and also enables the draw-in-key-order slider.
+- **The slice is a second point layer, not a recolour of the base buffer.** It draws exactly the rows the server returned. Recolouring in place would need a client-side box test, which proves nothing about the database.
+- **The plan label comes from the reply.** The optimizer does not always split, so the page shows the plan type that ran instead of assuming `MORTON_SPLIT_RANGE_SCAN`.
+- **The decode is done in JavaScript with `>>>`.** A float vertex attribute is exact only to 2^24, and `>>` turns ids of 32,768 and above negative.
+- **`FIND` now prints `dataset=` and `intensity=`** in place of the packed `metadata=` number, which was not in the plan but keeps rows readable.
+
+### Verification
+
+All run in scratch directories, so the repo's data files were not touched.
+
+| Check | Result |
+|---|---|
+| Build with `-Wall` | No warnings |
+| `tests/query_test.cpp`, with new rows for `dataset`, `AS DATASET` and the range errors | All passed |
+| Shell, 1 worker: `LOAD`, `COUNT ALL;`, filtered count, box count | 115,384, 4,962 and 20,264 |
+| `LOAD ... AS DATASET 2;` of the same frame | 115,384 in dataset 2, 0 in dataset 1 (the overwrite limit), filtered count still 4,962 |
+| `LOAD ... AS DATASET 0;` and `INSERT ... METADATA 70000;` | Parse errors |
+| `/api/points` before any `LOAD` | 0 rows |
+| `/api/points` after `LOAD` plus one `INSERT` | 115,384 rows, while `COUNT ALL;` gives 115,385 |
+| `/api/points` for the demo box, and with `imin=101` | 20,264 and 4,962, plan `MORTON_SPLIT_RANGE_SCAN` with 8 sub-boxes, as `EXPLAIN` prints |
+| Row order of both replies, checked with `point_key` | 0 rows out of order |
+| `POST`, unknown path, bad parameters, 9 KB request | 405, 404, 400, 400; the server kept answering |
+| 25 `/api/points` requests during a 2-worker `REBALANCE;` that moved 57,692 points | All 25 returned 115,384 |
+| Cluster tests from `a20327a` | 18 of 18 pass |
+| Page in headless Chrome against the live server | Cloud, Z-order colouring, crimson slice and 8 sub-box wireframes all drew |
+
+One fault was found and fixed during this: a request just over the 8 KB cap was accepted when its last chunk also held the blank line.
+
+### Known limits left in place
+
+- Datasets overwrite each other in shared millimetre cells, because the dataset id is not part of the index key.
+- Points stored before this change are dataset 0, so the viewer hides them until they are loaded again.
+- I tested the page only in headless Chrome with software rendering; mouse orbiting and the sliders were not exercised by hand.
+- The demo (`./spatial_db` without `--shell`) now prints packed payloads such as 65620 in its sample rows.
+
 ## 2026-11-10: Made 2PC survive a crash
 
 A transaction interrupted by a crash is now finished at the next start: committed on every shard if the coordinator had decided to commit, and aborted on every shard otherwise. Before this, staged records lived only in memory and the decision was written nowhere, so a crash between the phases could leave one shard with its part of a batch and another without. The work is uncommitted, on a new branch `feat/2pc-durability`.

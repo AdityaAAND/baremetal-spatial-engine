@@ -82,14 +82,15 @@ static bool send_records_to(const char* ip, int target_port, const std::vector<S
 static bool passes_filters(const SpatialRecord& rec, const FilteredQueryRequest& req) {
     for (uint8_t i = 0; i < req.filter_count; ++i) {
         const uint32_t value = req.filters[i].value;
+        const uint32_t field = rec.metadata & req.filters[i].mask;
         bool passed = false;
         switch (req.filters[i].op) {
-            case FILTER_EQ: passed = rec.metadata == value; break;
-            case FILTER_NE: passed = rec.metadata != value; break;
-            case FILTER_LT: passed = rec.metadata < value; break;
-            case FILTER_LE: passed = rec.metadata <= value; break;
-            case FILTER_GT: passed = rec.metadata > value; break;
-            case FILTER_GE: passed = rec.metadata >= value; break;
+            case FILTER_EQ: passed = field == value; break;
+            case FILTER_NE: passed = field != value; break;
+            case FILTER_LT: passed = field < value; break;
+            case FILTER_LE: passed = field <= value; break;
+            case FILTER_GT: passed = field > value; break;
+            case FILTER_GE: passed = field >= value; break;
         }
         if (!passed) return false;
     }

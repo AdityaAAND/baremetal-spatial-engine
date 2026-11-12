@@ -13,12 +13,14 @@ g++ -std=c++17 -O2 -Wall -pthread -o spatial_db \
     main.cpp Coordinator.cpp NetworkClient.cpp WorkerServer.cpp \
     BufferPool.cpp SpatialIndex.cpp MortonCode.cpp WriteAheadLog.cpp \
     MortonClient.cpp QueryOptimizer.cpp KittiLoader.cpp \
-    QueryLexer.cpp QueryParser.cpp QueryExecutor.cpp LineEditor.cpp
+    QueryLexer.cpp QueryParser.cpp QueryExecutor.cpp LineEditor.cpp \
+    VisualizerServer.cpp
 
 rm -f kitti_wal.dat   # for a clean run: existing WAL files are replayed on startup
 ./spatial_db          # demo; or: ./spatial_db path/to/frame.bin (default 000000.bin)
 ./spatial_db --shell  # interactive shell; see "Query shell" below
 ./spatial_db --shell --shards 4   # the same with 4 workers
+./spatial_db --shell --http       # the shell plus the 3D viewer at http://127.0.0.1:8080/
 ```
 
 The demo needs port 8081 free and a KITTI Velodyne frame. `000000.bin` is not in the repository, so supply your own copy. The demo starts one in-process worker, ingests the frame, and runs a bounding-box query over x ∈ [-10, 10], y ∈ [5, 25], z ∈ [-2, 3]. With the 115,384-point frame used during development, the output ends with:
@@ -36,12 +38,12 @@ Ingestion took about 3 seconds on the development Mac. The run creates `kitti_wa
 
 ```
 spatial> LOAD '000000.bin';
-loaded 115384 of 115384 points in 3109 ms
+loaded 115384 of 115384 points into dataset 1 in 3109 ms
 spatial> COUNT BOX x[-10,10] y[5,25] z[-2,3] WHERE intensity > 100;
 4962
 spatial> FIND BOX x[-10,10] y[5,25] z[-2,3] WHERE intensity > 100 LIMIT 2;
-(-9.929, 5.033, -1.752)  metadata=102
-(-9.922, 5.069, -1.754)  metadata=104
+(-9.929, 5.033, -1.752)  dataset=1 intensity=102
+(-9.922, 5.069, -1.754)  dataset=1 intensity=104
 2 rows
 ```
 
@@ -53,13 +55,15 @@ Every command ends with `;`, so a command can span several lines. Keywords ignor
 | `FIND ALL [WHERE ...] LIMIT n;` | Scans everything. `LIMIT` is required, so a typo can't pull back the whole database. |
 | `COUNT BOX ... [WHERE ...];` or `COUNT ALL [WHERE ...];` | Returns only the number of matches. |
 | `EXPLAIN FIND ...;` or `EXPLAIN COUNT ...;` | Shows the optimizer's plan without running the query. |
-| `INSERT POINT (x, y, z) [METADATA n];` | Inserts one point through 2PC. |
-| `LOAD 'file.bin';` | Loads a KITTI frame in batches. |
+| `INSERT POINT (x, y, z) [METADATA n];` | Inserts one point through 2PC, as dataset 0. `n` is its intensity, from 0 to 65,535. |
+| `LOAD 'file.bin' [AS DATASET n];` | Loads a KITTI frame in batches, as dataset `n` (1 to 65,535; 1 if left out). |
 | `SHOW SHARDS;` | Lists each worker's point count and key range. |
 | `REBALANCE;` | Moves points so every worker holds an equal share. See [Adding workers](#adding-workers). |
 | `HELP;` and `EXIT;` | Shows the commands, or quits. |
 
-`WHERE` compares `metadata` using `= != < <= > >=` against a whole number, with up to 4 conditions joined by `AND`. `intensity` is an alias for `metadata`, which holds reflectance scaled to 0–255 for KITTI data.
+`WHERE` compares `intensity`, `dataset` or `metadata` using `= != < <= > >=` against a whole number, with up to 4 conditions joined by `AND`. All three read the same 32-bit field, which is packed as `(dataset_id << 16) | intensity`: `dataset` is the high 16 bits, `intensity` the low 16 (reflectance scaled to 0–255 for KITTI data), and `metadata` the whole value. The worker masks the field before comparing, so `intensity > 100` means the same in every dataset.
+
+Points stored before datasets existed read as dataset 0. Two datasets can't hold a point in the same millimetre cell: the index is keyed by position alone, so the later point replaces the earlier one. Loading one frame under two dataset ids leaves only the second.
 
 A `FIND` with no `LIMIT` prints the first 50 rows and the total. Rows come back in key order, not sorted by any field.
 
@@ -76,6 +80,26 @@ At a terminal, you can edit the line you're typing:
 | Ctrl-D | Quit, on an empty line |
 
 Commands longer than the terminal scroll sideways. Only ASCII can be typed, and history isn't kept between sessions.
+
+## 3D viewer
+
+`./spatial_db --shell --http [PORT]` also serves a three.js viewer, on port 8080 unless you give another. Open `http://127.0.0.1:8080/` while the shell is running. `visualizer.html` must be in the directory you start `spatial_db` from, and the page loads three.js from a CDN, so the first load needs an internet connection.
+
+The viewer shows only points a `LOAD` ingested, read back from the workers. It never reads the `.bin` file, and it leaves out `INSERT` points (dataset 0). It checks for new points every 2 seconds, so a `LOAD` in the shell appears without a refresh.
+
+- **Colour modes:** intensity, dataset, height, or Z-order rank. Rank colours each point by its position in Morton key order, which shows how the curve keeps nearby points together and where it jumps between cells.
+- **Draw in Z-order:** the slider draws the cloud in key order, from the first key to the last.
+- **Box slice:** runs a box query (optionally with an intensity range) and draws the returned rows in crimson over the dimmed cloud. It also draws the sub-boxes the optimizer chose and shows the plan that ran, its key span and its scan cost.
+
+The server is a small HTTP/1.1 server in [VisualizerServer.cpp](VisualizerServer.cpp). It answers `GET` only, one request at a time, has no authentication, and listens on `127.0.0.1` only.
+
+| Route | Reply |
+|---|---|
+| `GET /` | `visualizer.html` |
+| `GET /api/points` | Loaded points as JSON: `count`, `truncated`, `plan`, a flat `positions` array (x, y, z per point) and a `payload` array. Rows are sorted by Morton key. Optional parameters: `xmin xmax ymin ymax zmin zmax` (an axis left out covers its full range), `dataset`, `imin`, `imax`, and `limit` (default and maximum 500,000). |
+| `GET /api/stats` | The number of loaded points, plus each worker's stored count and key ranges. |
+
+In JavaScript, decode a payload with `payload >>> 16` for the dataset and `payload & 0xFFFF` for the intensity. `>>` would turn dataset ids of 32,768 and above negative.
 
 ## Adding workers
 
@@ -149,7 +173,8 @@ More workers spread the data but don't add speed yet: the coordinator asks shard
 | Network | [NetworkProtocol.h](NetworkProtocol.h), [NetworkClient.h](NetworkClient.h), [NetworkClient.cpp](NetworkClient.cpp), [WorkerServer.h](WorkerServer.h), [WorkerServer.cpp](WorkerServer.cpp) | Packed binary protocol over POSIX TCP; WAL recovery and the worker request loop |
 | SDK | [MortonClient.h](MortonClient.h), [MortonClient.cpp](MortonClient.cpp), [QueryOptimizer.h](QueryOptimizer.h), [QueryOptimizer.cpp](QueryOptimizer.cpp) | Client API and key-range query planning |
 | Query language | [QueryLexer.h](QueryLexer.h), [QueryLexer.cpp](QueryLexer.cpp), [QueryParser.h](QueryParser.h), [QueryParser.cpp](QueryParser.cpp), [QueryExecutor.h](QueryExecutor.h), [QueryExecutor.cpp](QueryExecutor.cpp), [LineEditor.h](LineEditor.h), [LineEditor.cpp](LineEditor.cpp) | Turns typed text into tokens and then a `Command`, runs it through the SDK, and holds the shell loop with its line editing |
-| Dataset | [KittiLoader.h](KittiLoader.h), [KittiLoader.cpp](KittiLoader.cpp) | Reads KITTI `.bin` frames and loads them in batches |
+| Dataset | [KittiLoader.h](KittiLoader.h), [KittiLoader.cpp](KittiLoader.cpp) | Reads KITTI `.bin` frames and loads them in batches, tagged with a dataset id |
+| Viewer | [VisualizerServer.h](VisualizerServer.h), [VisualizerServer.cpp](VisualizerServer.cpp), [visualizer.html](visualizer.html) | HTTP JSON server for loaded points, and the three.js page that draws them |
 | Demo | [main.cpp](main.cpp) | Single-worker KITTI ingestion and query, plus the `--shell` entry point |
 
 ## Using the SDK
@@ -168,7 +193,7 @@ client.insert_batch(records);      // many records, one all-or-nothing transacti
 
 QueryResult result = client.query()
                            .bounding_box(-10, 10, 5, 25, -2, 3)
-                           .where(FILTER_GT, 100)   // on metadata; several calls are ANDed
+                           .where(FILTER_GT, 100, INTENSITY_MASK)   // on the low 16 bits of metadata; several calls are ANDed
                            .limit(5)
                            .execute();
 if (result.ok) { /* use result.records */ }
@@ -271,7 +296,8 @@ To test crash recovery, set `SPATIAL_DB_CRASH_POINT` to `after_prepare`, `after_
 - **Migration and rebalancing:** records move one worker at a time with no transaction around the whole operation. If a transfer fails, the shard map stays as it was, but points already moved can be missed by queries until `REBALANCE;` succeeds. A crash mid-rebalance can leave the same risk, and a target that took part of a failed transfer keeps those copies until the next `REBALANCE;`. Standbys aren't updated by a move. `SHOW SHARDS;` and `REBALANCE;` assume no other client is writing.
 - **Index:** keys come from coordinates alone, so two records in the same millimetre cell overwrite each other. The `CMD_INGEST` and `CMD_REPLICATE` paths skip range validation, so out-of-range coordinates are clamped there.
 - **Visibility:** buffered records can't be queried until the pool flushes. The demo uses a pool capacity of 1 so inserts are visible immediately.
-- **Query shell:** it runs its own workers in one process, so it can't connect to a cluster that is already running. `WHERE` only compares `metadata`, and results have no `ORDER BY`. `WHERE` saves network traffic but not scanning, because the worker still walks every key between the box corners. A `FIND` with no `LIMIT` transfers every match, even though the shell prints only 50.
+- **Query shell:** it runs its own workers in one process, so it can't connect to a cluster that is already running. `WHERE` only compares the `metadata` field (as `intensity`, `dataset` or whole), and results have no `ORDER BY`. `WHERE` saves network traffic but not scanning, because the worker still walks every key between the box corners. A `FIND` with no `LIMIT` transfers every match, even though the shell prints only 50.
+- **Viewer:** one request at a time, no authentication, and JSON rather than a binary format, so a reply is about 3 MB per 115,384 points and is capped at 500,000 points. The page needs a CDN for three.js. A dataset is a tag, not a separate store, so datasets overwrite each other in shared millimetre cells.
 - **Timestamps:** `LOAD` and `INSERT` store a timestamp of 0, and the index key ignores it, so a later frame would overwrite earlier points in the same millimetre cell.
 - **Optimizer:** it has no row statistics, so it can split a box over sparse data when the extra round trips cost more than they save.
 - **Networking:** each worker serves one connection at a time, most `send` and `recv` calls in `WorkerServer` are unchecked, and a worker can die from `SIGPIPE` if a client disappears mid-reply.

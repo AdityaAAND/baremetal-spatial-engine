@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Morton-DB viewer</title>
+<style>
+  :root { color-scheme: dark; --bg: #0b0e13; --panel: #141922; --line: #263042; --text: #dbe2ee; --muted: #8492a8; --accent: #5cc8ff; --hit: #dc143c; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #view { position: fixed; inset: 0 0 0 320px; }
+  canvas { display: block; }
+  #panel { position: fixed; inset: 0 auto 0 0; width: 320px; overflow-y: auto; background: var(--panel); border-right: 1px solid var(--line); padding: 14px 16px 24px; }
+  h1 { font-size: 15px; margin: 0 0 2px; }
+  h2 { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin: 18px 0 8px; border-top: 1px solid var(--line); padding-top: 12px; }
+  .muted { color: var(--muted); }
+  .big { font-size: 22px; font-variant-numeric: tabular-nums; }
+  label { display: block; margin: 6px 0 2px; color: var(--muted); }
+  select, input[type=number], button { width: 100%; background: #0e131b; color: var(--text); border: 1px solid var(--line); border-radius: 5px; padding: 6px 8px; font: inherit; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  button { cursor: pointer; }
+  button.primary { background: var(--hit); border-color: var(--hit); color: #fff; font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  .axis { display: grid; grid-template-columns: 18px 1fr 1fr; gap: 6px; align-items: center; margin-bottom: 6px; }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  td, th { text-align: left; padding: 3px 0; vertical-align: top; }
+  td.num, th.num { text-align: right; }
+  th { color: var(--muted); font-weight: 500; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; }
+  #plan { background: #0e131b; border: 1px solid var(--line); border-radius: 5px; padding: 8px; word-break: break-word; }
+  #plan b { color: var(--hit); }
+  #ramp { height: 8px; border-radius: 4px; margin-top: 6px; }
+  #message { position: fixed; left: 320px; right: 0; top: 40%; text-align: center; color: var(--muted); font-size: 15px; pointer-events: none; padding: 0 24px; }
+  #status { margin-top: 4px; }
+  #status.bad { color: #ff8b8b; }
+  @media (max-width: 760px) {
+    #panel { position: static; width: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+    #view { position: relative; inset: auto; height: 70vh; }
+    #message { left: 0; }
+  }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="panel">
+  <h1>Morton-DB viewer</h1>
+  <div class="muted">Points ingested by LOAD, read from the workers</div>
+  <div class="big" id="total">–</div>
+  <div id="status" class="muted">connecting…</div>
+
+  <h2>Colour</h2>
+  <select id="mode">
+    <option value="intensity">Intensity (low 16 bits of payload)</option>
+    <option value="dataset">Dataset (high 16 bits of payload)</option>
+    <option value="height">Height (z)</option>
+    <option value="zorder">Z-order rank (Morton key order)</option>
+  </select>
+  <div id="ramp"></div>
+  <div id="legend" class="muted" style="margin-top:6px"></div>
+  <label for="size">Point size</label>
+  <input id="size" type="range" min="1" max="6" step="0.5" value="1.5">
+  <label for="sweep">Draw in Z-order: <span id="sweepText">100%</span></label>
+  <input id="sweep" type="range" min="0" max="1000" value="1000">
+
+  <h2>Box slice</h2>
+  <div class="axis"><span>x</span><input id="xmin" type="number" step="any" value="-10"><input id="xmax" type="number" step="any" value="10"></div>
+  <div class="axis"><span>y</span><input id="ymin" type="number" step="any" value="5"><input id="ymax" type="number" step="any" value="25"></div>
+  <div class="axis"><span>z</span><input id="zmin" type="number" step="any" value="-2"><input id="zmax" type="number" step="any" value="3"></div>
+  <label>Intensity from / to (optional)</label>
+  <div class="pair"><input id="imin" type="number" min="0" max="65535" placeholder="min"><input id="imax" type="number" min="0" max="65535" placeholder="max"></div>
+  <div class="pair" style="margin-top:8px">
+    <button id="run" class="primary">Run slice</button>
+    <button id="clear" disabled>Clear</button>
+  </div>
+  <div id="plan" class="muted" style="margin-top:8px">No slice yet. An empty axis field covers that axis's full range.</div>
+
+  <h2>Workers</h2>
+  <table id="nodes"></table>
+  <div class="muted" style="margin-top:4px">Stored counts include points added by INSERT, which the view leaves out.</div>
+</div>
+<div id="view"></div>
+<div id="message"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const $ = (id) => document.getElementById(id);
+const view = $('view');
+
+// ---- scene ---------------------------------------------------------------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setClearColor(0x0b0e13);
+view.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 5000);
+camera.up.set(0, 0, 1); // KITTI Velodyne is x forward, y left, z up
+camera.position.set(-40, -40, 30);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+// The whole cloud is one geometry and one draw call. Colour modes only rewrite the colour attribute.
+const base = {
+  capacity: 0, count: 0,
+  positions: null, colors: null, payload: null,
+  geometry: new THREE.BufferGeometry(),
+  material: new THREE.PointsMaterial({ size: 1.5, sizeAttenuation: false, vertexColors: true, transparent: true }),
+  bounds: new THREE.Box3(),
+};
+base.points = new THREE.Points(base.geometry, base.material);
+base.points.frustumCulled = false;
+scene.add(base.points);
+
+// The slice is its own layer: exactly the rows the box query returned, drawn over the dimmed cloud
+const slice = {
+  geometry: new THREE.BufferGeometry(),
+  material: new THREE.PointsMaterial({ size: 3, sizeAttenuation: false, color: 0xdc143c }),
+  boxes: new THREE.Group(),
+  active: false,
+};
+slice.points = new THREE.Points(slice.geometry, slice.material);
+slice.points.frustumCulled = false;
+slice.points.renderOrder = 1;
+slice.points.visible = false;
+scene.add(slice.points, slice.boxes);
+
+function resize() {
+  const w = view.clientWidth, h = view.clientHeight;
+  renderer.setSize(w, h);
+  camera.aspect = w / Math.max(h, 1);
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', resize);
+resize();
+renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+
+// ---- colour ----------------------------------------------------------------
+const VIRIDIS = [[68,1,84],[72,40,120],[62,74,137],[49,104,142],[38,130,142],[31,158,137],[53,183,121],[109,205,89],[180,222,44],[253,231,37]];
+const CATEGORICAL = [[92,200,255],[255,176,72],[126,221,138],[214,140,255],[255,120,150],[240,228,96],[110,150,255],[90,220,210]];
+
+function ramp(t, out, at) {
+  const f = Math.min(Math.max(t, 0), 1) * (VIRIDIS.length - 1);
+  const i = Math.min(Math.floor(f), VIRIDIS.length - 2), k = f - i;
+  const a = VIRIDIS[i], b = VIRIDIS[i + 1];
+  out[at] = a[0] + (b[0] - a[0]) * k;
+  out[at + 1] = a[1] + (b[1] - a[1]) * k;
+  out[at + 2] = a[2] + (b[2] - a[2]) * k;
+}
+const css = (c) => `rgb(${c[0]},${c[1]},${c[2]})`;
+const datasetColor = (id) => CATEGORICAL[(id - 1 + CATEGORICAL.length * 8192) % CATEGORICAL.length];
+
+function recolor() {
+  const n = base.count, mode = $('mode').value;
+  const col = base.colors, pos = base.positions, pay = base.payload;
+  const datasets = new Map();
+  let maxIntensity = 1;
+  for (let i = 0; i < n; i++) {
+    // >>> keeps the id unsigned; >> would turn ids of 32768 and above negative
+    const id = pay[i] >>> 16, intensity = pay[i] & 0xFFFF;
+    datasets.set(id, (datasets.get(id) || 0) + 1);
+    if (intensity > maxIntensity) maxIntensity = intensity;
+  }
+  const zMin = base.bounds.min.z, zSpan = Math.max(base.bounds.max.z - zMin, 1e-6);
+
+  for (let i = 0; i < n; i++) {
+    const at = i * 3;
+    if (mode === 'intensity') ramp((pay[i] & 0xFFFF) / maxIntensity, col, at);
+    else if (mode === 'height') ramp((pos[at + 2] - zMin) / zSpan, col, at);
+    else if (mode === 'zorder') ramp(n > 1 ? i / (n - 1) : 0, col, at); // rows arrive sorted by Morton key
+    else { const c = datasetColor(pay[i] >>> 16); col[at] = c[0]; col[at + 1] = c[1]; col[at + 2] = c[2]; }
+  }
+  if (n) base.geometry.attributes.color.needsUpdate = true;
+
+  const legend = $('legend'), bar = $('ramp');
+  bar.style.display = mode === 'dataset' ? 'none' : 'block';
+  bar.style.background = `linear-gradient(90deg, ${VIRIDIS.map(css).join(',')})`;
+  if (mode === 'dataset') {
+    legend.innerHTML = [...datasets.entries()].sort((a, b) => a[0] - b[0])
+      .map(([id, count]) => `<div><span class="swatch" style="background:${css(datasetColor(id))}"></span>dataset ${id}: ${count.toLocaleString()} points</div>`).join('') || 'no points';
+  } else if (mode === 'intensity') legend.textContent = `0 to ${maxIntensity}`;
+  else if (mode === 'height') legend.textContent = n ? `${zMin.toFixed(2)} m to ${base.bounds.max.z.toFixed(2)} m` : '';
+  else legend.textContent = 'first key to last key. Colour jumps mark where the curve leaves one cell for the next.';
+}
+
+function applySweep() {
+  const fraction = $('sweep').value / 1000;
+  base.geometry.setDrawRange(0, Math.round(base.count * fraction));
+  $('sweepText').textContent = `${Math.round(fraction * 100)}%`;
+}
+
+// ---- data ------------------------------------------------------------------
+let fitted = false, loadedTotal = -1, fetching = false;
+
+function setBase(data) {
+  const n = data.count;
+  if (n > base.capacity) {
+    // Reallocated only when the cloud outgrows the buffers; otherwise they are refilled in place
+    base.capacity = Math.ceil(n * 1.25);
+    base.positions = new Float32Array(base.capacity * 3);
+    base.colors = new Uint8Array(base.capacity * 3);
+    base.payload = new Uint32Array(base.capacity);
+    base.geometry.dispose();
+    base.geometry = new THREE.BufferGeometry();
+    base.geometry.setAttribute('position', new THREE.BufferAttribute(base.positions, 3));
+    base.geometry.setAttribute('color', new THREE.BufferAttribute(base.colors, 3, true));
+    base.points.geometry = base.geometry;
+  }
+  base.count = n;
+  if (n) {
+    base.positions.set(data.positions);
+    base.payload.set(data.payload);
+    base.geometry.attributes.position.needsUpdate = true;
+  }
+
+  base.bounds.makeEmpty();
+  const p = base.positions, v = new THREE.Vector3();
+  for (let i = 0; i < n; i++) base.bounds.expandByPoint(v.set(p[i * 3], p[i * 3 + 1], p[i * 3 + 2]));
+
+  recolor();
+  applySweep();
+  $('total').textContent = `${n.toLocaleString()} points${data.truncated ? ' (first part only)' : ''}`;
+  $('message').textContent = n ? '' : "No loaded points yet. Run LOAD '000000.bin'; in the shell.";
+
+  if (n && !fitted) {
+    const sphere = base.bounds.getBoundingSphere(new THREE.Sphere());
+    const r = Math.max(sphere.radius, 1);
+    controls.target.copy(sphere.center);
+    camera.position.set(sphere.center.x - r * 0.55, sphere.center.y - r * 0.55, sphere.center.z + r * 0.45);
+    camera.near = r / 2000; camera.far = r * 20;
+    camera.updateProjectionMatrix();
+    fitted = true;
+  }
+}
+
+async function getJson(url) {
+  const response = await fetch(url);
+  const data = await response.json();
+  if (!data.ok) throw new Error(data.error || `request failed (${response.status})`);
+  return data;
+}
+
+async function refreshBase() {
+  if (fetching) return;
+  fetching = true;
+  try { setBase(await getJson('/api/points')); }
+  finally { fetching = false; }
+}
+
+function showNodes(nodes) {
+  $('nodes').innerHTML = '<tr><th>node</th><th class="num">stored</th><th class="num">key ranges</th></tr>' + nodes.map((node) =>
+    `<tr><td>${node.node}</td><td class="num">${node.points === null ? 'no answer' : node.points.toLocaleString()}</td><td class="num">${node.ranges.length || 'none'}</td></tr>`).join('');
+}
+
+async function poll() {
+  try {
+    const stats = await getJson('/api/stats');
+    showNodes(stats.nodes);
+    $('status').className = 'muted';
+    $('status').textContent = 'live: checks for new points every 2 s';
+    if (stats.loaded !== loadedTotal) {
+      await refreshBase();
+      loadedTotal = stats.loaded;
+    }
+  } catch (error) {
+    $('status').className = 'bad';
+    $('status').textContent = `not connected: ${error.message}`;
+  }
+  setTimeout(poll, 2000);
+}
+
+// ---- slice -----------------------------------------------------------------
+function clearSlice() {
+  slice.active = false;
+  slice.points.visible = false;
+  slice.boxes.clear();
+  base.material.opacity = 1;
+  base.material.depthWrite = true;
+  $('clear').disabled = true;
+  $('plan').className = 'muted';
+  $('plan').textContent = 'No slice yet. An empty axis field covers that axis\'s full range.';
+}
+
+async function runSlice() {
+  const params = new URLSearchParams();
+  for (const name of ['xmin', 'xmax', 'ymin', 'ymax', 'zmin', 'zmax', 'imin', 'imax']) {
+    if ($(name).value !== '') params.set(name, $(name).value);
+  }
+  $('run').disabled = true;
+  try {
+    const started = performance.now();
+    const data = await getJson(`/api/points?${params}`);
+    const ms = Math.round(performance.now() - started);
+
+    slice.geometry.dispose();
+    slice.geometry = new THREE.BufferGeometry();
+    slice.geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(data.positions), 3));
+    slice.points.geometry = slice.geometry;
+    slice.points.visible = true;
+    slice.active = true;
+
+    // Dimmed, and no longer writing depth, so a returned row is never hidden behind its own base point
+    base.material.opacity = 0.12;
+    base.material.depthWrite = false;
+
+    // An open axis reaches ±FLT_MAX, so each sub-box is drawn only as far as the cloud extends
+    slice.boxes.clear();
+    const limit = base.bounds.clone().expandByScalar(1);
+    for (const b of data.plan.sub_boxes) {
+      const box = new THREE.Box3(new THREE.Vector3(b[0], b[2], b[4]), new THREE.Vector3(b[1], b[3], b[5]));
+      if (!limit.isEmpty()) box.intersect(limit);
+      if (!box.isEmpty()) slice.boxes.add(new THREE.Box3Helper(box, 0xffd166));
+    }
+
+    const share = base.count ? ` (${(100 * data.count / base.count).toFixed(1)}% of the cloud)` : '';
+    $('plan').className = '';
+    $('plan').innerHTML = `<b>${data.plan.type}</b><br>${data.plan.sub_boxes.length} sub-box${data.plan.sub_boxes.length === 1 ? '' : 'es'}`
+      + `<br>rows returned: ${data.count.toLocaleString()}${share}${data.truncated ? ' (cut off at the limit)' : ''}`
+      + `<br>key span of the whole box: ${BigInt(data.plan.key_span).toLocaleString()}`
+      + `<br>key range this plan scans: ${BigInt(data.plan.scan_cost).toLocaleString()}`
+      + `<br><span class="muted">answered in ${ms} ms</span>`;
+    $('clear').disabled = false;
+  } catch (error) {
+    $('plan').className = '';
+    $('plan').textContent = `Slice failed: ${error.message}`;
+  } finally {
+    $('run').disabled = false;
+  }
+}
+
+$('mode').addEventListener('change', recolor);
+$('size').addEventListener('input', () => { base.material.size = +$('size').value; slice.material.size = +$('size').value + 1.5; });
+$('sweep').addEventListener('input', applySweep);
+$('run').addEventListener('click', runSlice);
+$('clear').addEventListener('click', clearSlice);
+
+poll();
+</script>
+</body>
+</html>

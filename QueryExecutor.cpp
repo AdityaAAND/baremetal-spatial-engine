@@ -5,13 +5,15 @@
 #include "QueryOptimizer.h"
 #include <algorithm>
 #include <cctype>
+#include <mutex>
 #include <string>
 
 // Keeps a large unlimited result from flooding the terminal; a query with LIMIT prints every row
 static constexpr size_t MAX_ROWS_SHOWN = 50;
 
-QueryExecutor::QueryExecutor(MortonClient& client_ref, Coordinator& coordinator_ref, std::ostream& output, const std::string& map_path)
-    : client(client_ref), coordinator(coordinator_ref), out(output), shard_map_path(map_path) {}
+QueryExecutor::QueryExecutor(MortonClient& client_ref, Coordinator& coordinator_ref, std::ostream& output, const std::string& map_path,
+                             std::shared_mutex& lock)
+    : client(client_ref), coordinator(coordinator_ref), out(output), shard_map_path(map_path), cluster_lock(lock) {}
 
 SpatialQueryBuilder QueryExecutor::build_query(const Command& command) {
     SpatialQueryBuilder query = client.query();
@@ -22,7 +24,7 @@ SpatialQueryBuilder QueryExecutor::build_query(const Command& command) {
         query.bounding_box(box.x_min, box.x_max, box.y_min, box.y_max, box.z_min, box.z_max);
     }
     for (const QueryFilter& filter : command.filters) {
-        query.where(static_cast<FilterOp>(filter.op), filter.value);
+        query.where(static_cast<FilterOp>(filter.op), filter.value, filter.mask);
     }
     query.limit(command.limit);
     return query;
@@ -39,7 +41,8 @@ void QueryExecutor::run_find(const Command& command) {
     const size_t shown = command.limit == 0 ? std::min(total, MAX_ROWS_SHOWN) : total;
     for (size_t i = 0; i < shown; ++i) {
         const SpatialRecord& rec = result.records[i];
-        out << "(" << rec.x << ", " << rec.y << ", " << rec.z << ")  metadata=" << rec.metadata << "\n";
+        out << "(" << rec.x << ", " << rec.y << ", " << rec.z << ")  dataset=" << payload_dataset(rec.metadata)
+            << " intensity=" << payload_intensity(rec.metadata) << "\n";
     }
     if (shown < total) {
         out << "showing the first " << shown << " of " << total << " rows; add LIMIT to choose how many\n";
@@ -79,12 +82,13 @@ void QueryExecutor::run_insert(const Command& command) {
 }
 
 void QueryExecutor::run_load(const Command& command) {
-    const KittiLoadResult result = KittiLoader::load_bin_file(client, command.path);
+    const KittiLoadResult result = KittiLoader::load_bin_file(client, command.path, command.dataset_id);
     if (!result.success) {
         out << "error: could not load " << command.path << "\n";
         return;
     }
-    out << "loaded " << result.points_inserted << " of " << result.total_points_read << " points in "
+    out << "loaded " << result.points_inserted << " of " << result.total_points_read << " points into dataset "
+        << command.dataset_id << " in "
         << static_cast<uint64_t>(result.elapsed_ms) << " ms\n";
 }
 
@@ -107,7 +111,10 @@ void QueryExecutor::run_show_shards() {
 }
 
 void QueryExecutor::run_rebalance() {
+    // Points are between workers and the shard map is replaced, so an HTTP query must not run meanwhile
+    std::unique_lock<std::shared_mutex> lock(cluster_lock);
     const RebalanceResult result = coordinator.rebalance(shard_map_path);
+    lock.unlock();
     if (!result.ok) {
         out << "error: " << result.error << "\n";
         return;
@@ -121,16 +128,18 @@ void QueryExecutor::run_help() {
         << "  FIND BOX x[-10,10] y[5,25] z[-2,3] WHERE intensity > 100 LIMIT 5;\n"
         << "  FIND ALL LIMIT 100;\n"
         << "  COUNT BOX x[-10,10] y[5,25];\n"
-        << "  COUNT ALL WHERE metadata >= 50;\n"
+        << "  COUNT ALL WHERE dataset = 2 AND intensity >= 50;\n"
         << "  EXPLAIN FIND BOX x[-10,10] y[5,25] z[-2,3];\n"
         << "  INSERT POINT (1.5, 2.5, 3.5) METADATA 42;\n"
         << "  LOAD '000000.bin';\n"
+        << "  LOAD '000001.bin' AS DATASET 2;\n"
         << "  SHOW SHARDS;\n"
         << "  REBALANCE;\n"
         << "  HELP;\n"
         << "  EXIT;\n"
-        << "An axis left out of BOX covers its full range. WHERE compares metadata\n"
-        << "(or its alias intensity) using = != < <= > >=, with up to 4 joined by AND.\n";
+        << "An axis left out of BOX covers its full range. WHERE compares intensity, dataset\n"
+        << "or metadata (both packed together) using = != < <= > >=, with up to 4 joined by AND.\n"
+        << "LOAD stores its points as dataset 1 unless AS DATASET names another; INSERT stores dataset 0.\n";
 }
 
 bool QueryExecutor::run(const Command& command) {

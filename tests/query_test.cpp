@@ -34,6 +34,9 @@ int main() {
     accepts("INSERT POINT (1, 2, 3);", CommandKind::INSERT);
     accepts("LOAD '000000.bin';", CommandKind::LOAD);
     accepts("LOAD \"a;b.bin\";", CommandKind::LOAD);
+    accepts("LOAD '000000.bin' AS DATASET 2;", CommandKind::LOAD);
+    accepts("COUNT ALL WHERE dataset = 2 AND intensity >= 50;", CommandKind::COUNT);
+    accepts("COUNT ALL WHERE metadata > 70000;", CommandKind::COUNT);
     accepts("SHOW SHARDS;", CommandKind::SHOW_SHARDS);
     accepts("REBALANCE;", CommandKind::REBALANCE);
     accepts("rebalance;", CommandKind::REBALANCE);
@@ -56,7 +59,13 @@ int main() {
     rejects("FIND ALL LIMIT -1;", "whole number");
     rejects("FIND ALL LIMIT 2.5;", "whole number");
     rejects("COUNT ALL LIMIT 5;", "expected ';'");
-    rejects("COUNT ALL WHERE x > 1;", "metadata or intensity");
+    rejects("COUNT ALL WHERE x > 1;", "metadata, intensity or dataset");
+    rejects("COUNT ALL WHERE dataset = 65536;", "0 to 65535");
+    rejects("COUNT ALL WHERE intensity > 70000;", "0 to 65535");
+    rejects("LOAD 'a.bin' AS DATASET 0;", "1 to 65535");
+    rejects("LOAD 'a.bin' AS DATASET 65536;", "1 to 65535");
+    rejects("LOAD 'a.bin' AS 2;", "expected DATASET");
+    rejects("INSERT POINT (1, 2, 3) METADATA 70000;", "0 to 65535");
     rejects("COUNT ALL WHERE metadata == 1;", "whole number");
     rejects("COUNT ALL WHERE metadata > 99999999999;", "too large");
     rejects("COUNT ALL WHERE metadata>1 AND metadata>2 AND metadata>3 AND metadata>4 AND metadata>5;", "at most 4");
@@ -73,7 +82,18 @@ int main() {
     const ParseResult alias = parse_command("COUNT ALL WHERE intensity >= 7;");
     const ParseResult plain = parse_command("COUNT ALL WHERE metadata >= 7;");
     check(alias.ok && plain.ok && alias.command.filters[0].op == plain.command.filters[0].op
-          && alias.command.filters[0].value == plain.command.filters[0].value, "intensity parses the same as metadata");
+          && alias.command.filters[0].value == plain.command.filters[0].value
+          && alias.command.filters[0].mask == 0xFFFFu && plain.command.filters[0].mask == 0xFFFFFFFFu,
+          "intensity compares the low 16 bits and metadata all 32");
+
+    const ParseResult tagged = parse_command("COUNT ALL WHERE dataset = 2;");
+    check(tagged.ok && tagged.command.filters[0].value == (2u << 16) && tagged.command.filters[0].mask == 0xFFFF0000u,
+          "dataset compares the high 16 bits");
+
+    const ParseResult default_load = parse_command("LOAD 'a.bin';");
+    const ParseResult named_load = parse_command("LOAD 'a.bin' AS DATASET 7;");
+    check(default_load.ok && default_load.command.dataset_id == 1 && named_load.ok && named_load.command.dataset_id == 7,
+          "LOAD defaults to dataset 1 and AS DATASET overrides it");
 
     const ParseResult partial = parse_command("COUNT BOX y[1,2];");
     check(partial.ok && partial.command.box.y_min == 1.0f && partial.command.box.x_min < -1.0e30f

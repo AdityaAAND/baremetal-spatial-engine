@@ -16,6 +16,7 @@ struct KittiLoadResult {
 
 class KittiLoader {
 public:
-    // Reads raw KITTI .bin files (x, y, z, reflectance) and streams points via MortonClient
-    static KittiLoadResult load_bin_file(MortonClient& client, const std::string& filepath);
+    // Reads raw KITTI .bin files (x, y, z, reflectance) and streams points via MortonClient.
+    // Each point's metadata is pack_payload(dataset_id, reflectance scaled to 0-255).
+    static KittiLoadResult load_bin_file(MortonClient& client, const std::string& filepath, uint32_t dataset_id = 1);
 };
